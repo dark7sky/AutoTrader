@@ -57,7 +57,7 @@ def test_balance_client_queries_demo_positions_read_only():
     assert kwargs["params"]["ACNT_PRDT_CD"] == "01"
 
 
-def test_reconciliation_closes_local_only_position_without_operator_review(tmp_path, monkeypatch):
+def test_reconciliation_keeps_local_only_position_for_operator_review(tmp_path, monkeypatch):
     _patch_reconciliation_dependencies(monkeypatch, broker_positions=())
     db_path = tmp_path / "positions.db"
     with connect_database(db_path) as database:
@@ -78,11 +78,11 @@ def test_reconciliation_closes_local_only_position_without_operator_review(tmp_p
         "config/settings.yaml", cli.KisEnvironment.DEMO, str(db_path), False,
     )
 
-    assert ok is True
-    assert messages == ["local_positions_closed=005930:2"]
+    assert ok is False
+    assert messages == ["operator_review_local_position_only=005930:2"]
     with connect_database(db_path) as database:
         database.init_schema()
-        assert database.list_open_live_positions("005930") == []
+        assert len(database.list_open_live_positions("005930")) == 1
 
 
 def test_reconciliation_requests_operator_review_for_broker_only_position(tmp_path, monkeypatch):

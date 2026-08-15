@@ -4,6 +4,10 @@
 data/
 logs/
 .tmp_pytest*/
+.tmp_agent*/
+.tmp_main_*/
+.tmp_reconciliation*/
+.tmp*/
 .pytest_cache/
 .pytest-tmp/
 __pycache__/
@@ -14,3 +18,9 @@ __pycache__/
 .idea/
 .vscode/
 *.sqlite3
+*.sqlite3-*
+*.log
+dist/
+build/
+htmlcov/
+.coverage

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 import json
+import os
+import random
+import time
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -13,6 +16,7 @@ import requests
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kis_ai_scalper.market.features import BarFeatureSnapshot
+from .reliable import AIBudgetExceededError, AIUsage, UsageBudget
 
 
 class AIDecisionAction(StrEnum):
@@ -68,6 +72,7 @@ class AIDecisionContext:
     candidates: list[dict[str, Any]]
     latest_price: float
     open_position: dict[str, Any] | None = None
+    market_snapshot_at: datetime | None = None
 
 
 class TradingAIClient(Protocol):
@@ -111,53 +116,216 @@ class RuleBasedAIClient:
         )
 
 
+class AIDecisionError(RuntimeError):
+    """Base class for a decision request that cannot be used safely."""
+
+
+class AIDecisionTransportError(AIDecisionError):
+    """A timeout or retryable HTTP failure exhausted its bounded retries."""
+
+
+class AIDecisionRequestError(AIDecisionError):
+    """A non-retryable HTTP request failure."""
+
+
+class AIDecisionResponseError(AIDecisionError):
+    """The response was not a valid decision for the requested symbol."""
+
+
 class OpenAITradingDecisionClient:
-    """Minimal requests-based OpenAI Chat Completions structured-output client."""
+    """Reliable requests-based structured-output decision client.
+
+    Only transient HTTP failures (429/5xx) and request timeouts are retried.
+    This class never submits broker orders, so its retry policy cannot repeat an
+    order. The injected ``UsageBudget`` is shared safely by concurrent callers.
+    """
 
     def __init__(
         self,
         api_key: str,
         *,
-        model: str = "gpt-4o-mini",
+        model: str | None = None,
         session: Any | None = None,
         timeout: float = 20.0,
+        max_retries: int = 2,
+        retry_base_delay: float = 0.25,
+        retry_max_delay: float = 2.0,
+        sleep: Any = time.sleep,
+        random_fn: Any = random.random,
+        clock: Any = lambda: datetime.now(timezone.utc),
+        max_snapshot_age_seconds: float | None = 90.0,
+        require_snapshot_timestamp: bool = False,
+        budget: UsageBudget | None = None,
+        estimated_cost_per_call_usd: float = 0.01,
+        input_cost_per_million_tokens: float | None = None,
+        output_cost_per_million_tokens: float | None = None,
+        on_budget_exceeded: str = "hold",
     ) -> None:
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        if retry_base_delay < 0 or retry_max_delay < 0:
+            raise ValueError("retry delays must be non-negative")
+        if retry_max_delay < retry_base_delay:
+            raise ValueError("retry_max_delay must be >= retry_base_delay")
+        if max_snapshot_age_seconds is not None and max_snapshot_age_seconds < 0:
+            raise ValueError("max_snapshot_age_seconds must be non-negative")
+        if on_budget_exceeded not in {"hold", "raise"}:
+            raise ValueError("on_budget_exceeded must be 'hold' or 'raise'")
         self.api_key = api_key
-        self.model = model
+        self.model = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         self.session = session or requests.Session()
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_max_delay = retry_max_delay
+        self.sleep = sleep
+        self.random_fn = random_fn
+        self.clock = clock
+        self.max_snapshot_age_seconds = max_snapshot_age_seconds
+        self.require_snapshot_timestamp = require_snapshot_timestamp
+        self.budget = budget or UsageBudget.from_env(clock=clock)
+        self.estimated_cost_per_call_usd = float(estimated_cost_per_call_usd)
+        if self.estimated_cost_per_call_usd < 0:
+            raise ValueError("estimated_cost_per_call_usd must be non-negative")
+        default_input, default_output = _model_cost_rates(self.model)
+        self.input_cost_per_million_tokens = (
+            default_input if input_cost_per_million_tokens is None else float(input_cost_per_million_tokens)
+        )
+        self.output_cost_per_million_tokens = (
+            default_output if output_cost_per_million_tokens is None else float(output_cost_per_million_tokens)
+        )
+        if self.input_cost_per_million_tokens < 0 or self.output_cost_per_million_tokens < 0:
+            raise ValueError("token costs must be non-negative")
+        self.on_budget_exceeded = on_budget_exceeded
+        self.last_usage = AIUsage()
+        self.total_usage = AIUsage()
 
     def decide(self, context: AIDecisionContext) -> TradingAIDecision:
-        response = self.session.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "authorization": f"Bearer {self.api_key}",
-                "content-type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps(context.__dict__, sort_keys=True)},
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "trading_ai_decision",
-                        "strict": True,
-                        "schema": trading_ai_decision_schema(),
+        self._validate_snapshot(context)
+        for attempt in range(self.max_retries + 1):
+            reservation = None
+            try:
+                reservation = self.budget.reserve_call(self.estimated_cost_per_call_usd)
+                response = self.session.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "authorization": f"Bearer {self.api_key}",
+                        "content-type": "application/json",
                     },
-                },
-                "temperature": 0,
-            },
-            timeout=self.timeout,
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": _SYSTEM_PROMPT},
+                            {"role": "user", "content": json.dumps(_context_payload(context), sort_keys=True)},
+                        ],
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "trading_ai_decision",
+                                "strict": True,
+                                "schema": trading_ai_decision_schema(),
+                            },
+                        },
+                        "temperature": 0,
+                    },
+                    timeout=self.timeout,
+                )
+                status_code = getattr(response, "status_code", None)
+                if status_code == 429 or (status_code is not None and 500 <= status_code <= 599):
+                    raise _RetryableHTTPError(f"OpenAI transient HTTP status {status_code}")
+                if status_code is not None and 400 <= status_code <= 499:
+                    self.budget.cancel(reservation)
+                    raise AIDecisionRequestError(f"OpenAI request rejected with HTTP {status_code}")
+                response.raise_for_status()
+                payload = response.json()
+                usage = self._extract_usage(payload)
+                self.last_usage = usage
+                self.total_usage = AIUsage(
+                    self.total_usage.prompt_tokens + usage.prompt_tokens,
+                    self.total_usage.completion_tokens + usage.completion_tokens,
+                    self.total_usage.total_tokens + usage.total_tokens,
+                    self.total_usage.estimated_cost_usd + usage.estimated_cost_usd,
+                )
+                self.budget.settle(reservation, usage.estimated_cost_usd)
+                reservation = None
+                content = payload["choices"][0]["message"]["content"]
+                if isinstance(content, dict):
+                    decision = TradingAIDecision.model_validate(content)
+                else:
+                    decision = TradingAIDecision.model_validate_json(content)
+                if decision.symbol != context.symbol:
+                    raise AIDecisionResponseError(
+                        f"OpenAI response symbol mismatch: expected {context.symbol}, got {decision.symbol}"
+                    )
+                return decision
+            except AIBudgetExceededError as exc:
+                if reservation is not None:
+                    self.budget.cancel(reservation)
+                return self._budget_fallback(context, exc)
+            except (requests.exceptions.Timeout, _RetryableHTTPError) as exc:
+                if reservation is not None:
+                    self.budget.cancel(reservation)
+                if attempt >= self.max_retries:
+                    raise AIDecisionTransportError(str(exc)) from exc
+                delay = min(self.retry_max_delay, self.retry_base_delay * (2 ** attempt))
+                self.sleep(delay * (0.5 + self.random_fn()))
+            except (KeyError, TypeError, ValueError) as exc:
+                if reservation is not None:
+                    self.budget.cancel(reservation)
+                raise AIDecisionResponseError("OpenAI response did not match the decision schema") from exc
+            except Exception:
+                if reservation is not None:
+                    self.budget.cancel(reservation)
+                raise
+
+        raise AssertionError("bounded retry loop did not return")
+
+    def _extract_usage(self, payload: dict[str, Any]) -> AIUsage:
+        raw = payload.get("usage") or {}
+        prompt_tokens = int(raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0)
+        completion_tokens = int(raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0)
+        total_tokens = int(raw.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+        cost = (
+            prompt_tokens * self.input_cost_per_million_tokens
+            + completion_tokens * self.output_cost_per_million_tokens
+        ) / 1_000_000
+        return AIUsage(prompt_tokens, completion_tokens, total_tokens, cost)
+
+    def _validate_snapshot(self, context: AIDecisionContext) -> None:
+        snapshot_at = context.market_snapshot_at or _snapshot_timestamp(context.features)
+        if snapshot_at is None:
+            if self.require_snapshot_timestamp:
+                raise AIDecisionResponseError("market snapshot timestamp is required")
+            return
+        if isinstance(snapshot_at, str):
+            try:
+                snapshot_at = datetime.fromisoformat(snapshot_at)
+            except ValueError as exc:
+                raise AIDecisionResponseError("market snapshot timestamp is invalid") from exc
+        snapshot_at = _aware(snapshot_at)
+        age = (self.clock() - snapshot_at).total_seconds()
+        if age < -5:
+            raise AIDecisionResponseError("market snapshot timestamp is in the future")
+        if self.max_snapshot_age_seconds is not None and age > self.max_snapshot_age_seconds:
+            raise AIDecisionResponseError("market snapshot is stale")
+
+    def _budget_fallback(
+        self, context: AIDecisionContext, error: AIBudgetExceededError
+    ) -> TradingAIDecision:
+        if self.on_budget_exceeded == "raise":
+            raise error
+        return TradingAIDecision(
+            symbol=context.symbol,
+            action=AIDecisionAction.HOLD,
+            confidence=0.0,
+            risk_level=AIRiskLevel.HIGH,
+            requires_operator_approval=True,
+            rationale=f"AI call blocked by safety budget: {error}",
         )
-        response.raise_for_status()
-        payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-        return TradingAIDecision.model_validate_json(content)
 
 
 def context_from_snapshot(
@@ -165,6 +333,7 @@ def context_from_snapshot(
     candidates: list[Any],
     *,
     open_position: dict[str, Any] | None = None,
+    market_snapshot_at: datetime | None = None,
 ) -> AIDecisionContext:
     return AIDecisionContext(
         symbol=snapshot.symbol,
@@ -172,7 +341,55 @@ def context_from_snapshot(
         candidates=[getattr(candidate, "__dict__", dict(candidate)) for candidate in candidates],
         latest_price=snapshot.latest_close,
         open_position=open_position,
+        market_snapshot_at=market_snapshot_at,
     )
+
+
+def _context_payload(context: AIDecisionContext) -> dict[str, Any]:
+    payload = {
+        "symbol": context.symbol,
+        "features": context.features,
+        "candidates": context.candidates,
+        "latest_price": context.latest_price,
+        "open_position": context.open_position,
+    }
+    if context.market_snapshot_at is not None:
+        payload["market_snapshot_at"] = _aware(context.market_snapshot_at).isoformat()
+    return payload
+
+
+def _snapshot_timestamp(features: dict[str, Any]) -> datetime | str | None:
+    for key in (
+        "market_snapshot_at",
+        "snapshot_at",
+        "timestamp",
+        "bar_timestamp",
+        "bar_start",
+        "latest_bar_timestamp",
+    ):
+        value = features.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _model_cost_rates(model: str) -> tuple[float, float]:
+    """Return configurable estimates; unknown models use a conservative default."""
+    rates = {
+        "gpt-4o-mini": (0.15, 0.60),
+        "gpt-4o": (2.50, 10.00),
+    }
+    return rates.get(model.lower(), (0.15, 0.60))
+
+
+class _RetryableHTTPError(RuntimeError):
+    pass
 
 
 def trading_ai_decision_schema() -> dict[str, Any]:

@@ -1,479 +1,234 @@
 # KIS AI Scalper
 
-한국투자증권 KIS Open API 기반의 한국 주식 단타 자동매매 프로젝트입니다.
+한국투자증권 KIS Open API와 KRX 장중 데이터를 이용하는 국내 주식 단타 자동매매 프로젝트입니다. 이 저장소의 코드는 **운영을 시작할 수 있도록 준비된 상태**이며, 실전 검증이 완료되었다는 의미는 아닙니다. 실제 주문 접수, 체결·미체결 응답, Telegram 운영, 잔고 대조는 장중 KIS 모의계좌에서 확인해야 합니다.
 
-현재 목표는 **모의계좌에서 장중 검증 가능한 AI 자동매매 1-cycle 시스템**입니다. watchlist에 등록한 종목을 대상으로 시세를 수집하고, AI가 진입/보류를 판단하며, deterministic risk engine이 수량과 위험을 다시 제한합니다. 일반 진입/청산은 자동으로 처리하고, 고위험 판단만 Telegram 승인 대기로 보냅니다.
+운영자는 먼저 `trading-service`를 모의계좌로 실행하고, 점검이 끝난 뒤 Telegram에서 resume합니다. 실계좌 전환은 모의계좌 장중 검증 결과를 확인한 후 별도로 판단합니다.
 
-## 현재 구현 상태
+## 운영 핵심
 
-구현된 기능:
+- Docker의 기본 장기 실행 대상은 `trading-service` 단독 서비스입니다. `app`, smoke, collector, `telegram-poll`, `auto-trade-cycle`은 별도 도구 또는 프로파일입니다.
+- 서비스는 시작할 때마다 runtime `paused=true`를 기록합니다. 기존 DB가 running이었어도 자동으로 재개하지 않습니다.
+- `paused` 상태에서 환경을 확인하고 Telegram `/resume`으로만 자동매매를 시작합니다.
+- Telegram `/env demo`와 `/env real` 전환은 paused 상태에서만 가능합니다. real은 challenge 확인 절차가 추가됩니다.
+- 주문 전 KRX `XKRX` 거래소 캘린더를 확인합니다. 캘린더가 준비되지 않으면 broker preflight가 fail-closed로 동작합니다.
+- 브로커에만 있는 기존 잔고를 local 포지션으로 자동 채택하지 않습니다. local에만 있거나 수량이 다른 포지션도 자동 청산하지 않습니다.
+- 잔고·주문·체결 불일치가 있으면 신규 진입을 차단하고 `operator_review`를 기록한 뒤 Telegram으로 문의합니다. 운영자가 원인을 확인하기 전에는 resume하지 않습니다.
+- 미체결 BUY는 기본 60초, SELL은 기본 30초 후 취소를 요청합니다. 취소 HTTP 응답은 확정 체결 취소가 아니므로 KIS의 terminal 상태를 다시 확인할 때까지 `CANCEL_PENDING`으로 둡니다.
+- 고위험 AI BUY만 운영자 승인 대기로 보냅니다. 승인 요청은 2분 후 만료되며, 승인 전에는 주문하지 않습니다.
+- OpenAI 비용 조회 전용 키는 선택 사항입니다. 비용 키가 없으면 AI 판단과 별개로 비용 리포트만 `unavailable`이 될 수 있습니다.
+- `data/`에는 SQLite, KIS token cache, runtime state가 남습니다. 운영에서는 반드시 영속 볼륨과 백업 정책을 사용합니다.
 
-- KIS REST 인증 및 현재가 smoke test
-- KIS WebSocket 실시간 체결가 smoke test
-- 제한 시간 market collector
-- SQLite 기반 tick, 1분봉, 후보 신호 저장
-- 시장 데이터 health gate
-- deterministic 후보 스캐너와 risk engine
-- paper ledger 및 paper report
-- Telegram `/pause`, `/resume`, `/status`, `/report`, `/cost`, `/control`
-- KIS 국내주식 현금주문 BUY/SELL 어댑터
-- watchlist 관리
-- OpenAI 기반 AI 매매 판단 클라이언트
-- rule 기반 dry-run AI 클라이언트
-- 자동 BUY, 자동 손절/익절/타임스탑 SELL
-- 고위험 AI 판단 시 주문 차단 및 승인 요청 기록
-- OpenAI 비용 조회 리포트
-- Docker/Portainer 실행용 compose 서비스
+## 현재 상태와 검증 범위
 
-아직 반드시 모의계좌에서 검증해야 하는 것:
+구현된 주요 경로:
 
-- 실제 KIS 모의계좌 BUY 주문 정상 접수
-- 실제 KIS 모의계좌 SELL 주문 정상 접수
-- 체결/미체결 상황에서의 응답 형태
-- Telegram 사후보고 확인
-- `/pause` 즉시 차단 확인
-- OpenAI 비용 조회 권한 확인
+- KIS REST/WebSocket 인증과 국내주식 현재가·체결가 수집
+- SQLite 기반 tick, 1분봉, AI 판단, broker 주문·체결 ledger
+- KRX 캘린더 기반 장중 gate와 신규진입 시간 gate
+- deterministic risk engine, 잔고·local position 대조, 주문 상태 재조회
+- BUY/SELL 미체결 주문 만료 취소와 취소 확정 대기
+- 일반 BUY 및 손절·익절·타임스탑·장 마감 SELL 처리
+- 고위험 BUY의 Telegram 승인 요청과 2분 만료
+- Telegram pause/resume/status/report/cost/control/environment/positions/orders/fills/approvals
+- Docker healthcheck, service lease, heartbeat, 데이터 보존 정리
 
-실계좌 전환은 위 항목이 장중에 검증된 뒤에만 진행해야 합니다.
+아직 장중 모의계좌에서 확인해야 하는 항목:
 
-## 안전 원칙
+- KIS 모의계좌 BUY·SELL의 실제 접수와 체결 결과
+- 부분 체결·미체결·취소 확정 응답의 실제 형태
+- KIS 잔고와 local ledger 대조가 운영 상황에서 의도대로 멈추는지
+- Telegram 승인, pause, 불일치 문의, 사후 리포트
+- OpenAI 호출 비용·권한과 비용 제한
 
-- 기본 런타임 상태는 `paused=true`입니다.
-- 새 SQLite control DB는 `environment=demo`와 함께 paused로 시작합니다.
-- Docker `trading-service`는 시작할 때 기존 DB 상태와 무관하게 먼저 `paused=true`로 되돌립니다.
-- 자동매매는 `control-resume` 후에만 동작합니다.
-- Telegram에서 environment를 바꿀 때는 반드시 paused 상태여야 합니다.
-- Docker 서비스는 Telegram에 저장된 runtime environment로 demo/real을 선택합니다.
-- 주문은 KRX `XKRX` 캘린더 기준 장중에만 시도합니다.
-- `trading-service`는 장중 cycle 전에 KIS 잔고조회와 local DB live position을 대조합니다.
-- 브로커 잔고와 local live position이 불일치하면 상황별로 처리합니다.
-- local DB에만 남고 브로커에 없는 포지션은 이미 청산/미체결된 것으로 보고 local position을 `broker_position_missing`으로 종료 처리합니다.
-- 브로커에만 있거나 수량이 다른 포지션은 이상 상황으로 보고 해당 cycle의 주문을 보류하고 Telegram으로 운영자 판단을 요청합니다. runtime pause 플래그는 자동으로 바꾸지 않습니다.
-- local DB에 남은 미청산 live position과 브로커 잔고가 일치하면 다음 장중 cycle에서 신규 진입보다 먼저 손절/익절/타임스탑/전일잔고 청산 대상으로 처리합니다.
-- pause 중 수동 주문, 외부 체결, 기존 실계좌 잔고처럼 DB 밖에서 생긴 잔고는 자동 매매하지 않고 operator 확인을 요구합니다.
-- `auto-trade-cycle`은 `--confirm AUTO_TRADE`가 없으면 KIS/OpenAI 호출 전에 차단됩니다.
-- 실전/모의 주문은 `LIVE_TRADING_ENABLED=true`와 `live_trading_enabled: true`가 모두 필요합니다.
-- demo 주문은 `TRADING_MODE=micro_live` 또는 `TRADING_MODE=live`가 필요합니다.
-- real 주문은 `TRADING_MODE=live`가 필요합니다.
-- `.env`, `data/`, token cache, SQLite DB는 git에 올리지 않습니다.
-- 첫 모의계좌 테스트는 반드시 `--max-quantity 1`로 시작합니다.
+따라서 문서의 상태 표현은 “코드 준비 완료, 장중 모의 검증 필요”입니다. “실전 검증 완료”로 해석하지 마세요.
 
-## 필요한 키와 환경변수
+## 필수 설정
 
-프로젝트 루트의 `.env`에 넣습니다.
+비밀값은 로컬 `.env` 또는 Portainer Stack 환경변수에만 입력합니다. 아래 예시는 모두 자리표시자입니다.
 
-경로:
-
-```text
-C:\Users\ysyoo\Documents\Visual Studio 2019\Python\260815_AutoTrade\.env
-```
-
-필수:
-
-```text
+```dotenv
 TRADING_MODE=micro_live
-LIVE_TRADING_ENABLED=true
+CONFIG_LIVE_TRADING_ENABLED=false
+LIVE_TRADING_ENABLED=false
 KIS_ENV=demo
-KIS_DEMO_APP_KEY=...
-KIS_DEMO_APP_SECRET=...
-KIS_DEMO_ACCOUNT_NO=...
+
+KIS_DEMO_APP_KEY=<KIS_DEMO_APP_KEY>
+KIS_DEMO_APP_SECRET=<KIS_DEMO_APP_SECRET>
+KIS_DEMO_ACCOUNT_NO=<KIS_DEMO_ACCOUNT_NO>
 KIS_DEMO_ACCOUNT_PRODUCT_CODE=01
-OPENAI_API_KEY=...
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_ALLOWED_CHAT_ID=...
-```
 
-선택:
+TELEGRAM_BOT_TOKEN=<TELEGRAM_BOT_TOKEN>
+TELEGRAM_ALLOWED_CHAT_ID=<TELEGRAM_ALLOWED_CHAT_ID>
+# 그룹에서 사용할 때만 선택: TELEGRAM_ALLOWED_USER_ID=<TELEGRAM_ALLOWED_USER_ID>
 
-```text
+OPENAI_API_KEY=<OPENAI_API_KEY>
 OPENAI_MODEL=gpt-4o-mini
-OPENAI_ADMIN_KEY=...
-# 또는
-OPENAI_USAGE_API_KEY=...
 AUTO_TRADE_AI=openai
 AUTO_TRADE_MAX_QUANTITY=1
-AUTO_TRADE_COLLECT_SECONDS=10
+AUTO_TRADE_COLLECT_SECONDS=50
 AUTO_TRADE_CYCLE_INTERVAL_SECONDS=60
-KIS_REAL_APP_KEY=...
-KIS_REAL_APP_SECRET=...
-KIS_REAL_ACCOUNT_NO=...
-KIS_REAL_ACCOUNT_PRODUCT_CODE=01
+DATA_DIR=./data
 ```
 
-### KIS 키
+### 주문 게이트
 
-필요한 값:
+저장소 기본값은 `CONFIG_LIVE_TRADING_ENABLED=false`, `LIVE_TRADING_ENABLED=false`입니다. Portainer에서 주문 기능을 열 때는 다음 두 값을 모두 `true`로 설정해야 합니다.
 
-- 모의투자: `KIS_DEMO_APP_KEY`, `KIS_DEMO_APP_SECRET`
-- 모의계좌: `KIS_DEMO_ACCOUNT_NO`, `KIS_DEMO_ACCOUNT_PRODUCT_CODE`
-- 실전투자: `KIS_REAL_APP_KEY`, `KIS_REAL_APP_SECRET`
-- 실전계좌: `KIS_REAL_ACCOUNT_NO`, `KIS_REAL_ACCOUNT_PRODUCT_CODE`
-
-KIS 개발자 포털에서 모의투자 앱을 먼저 만들고 demo 환경으로 테스트합니다. 실전 앱/실계좌 값은 모의계좌 BUY/SELL이 검증된 뒤에만 사용합니다.
-
-중요:
-
-- `KIS_HTS_ID`는 app key가 아닙니다. 현재 주문/시세 경로에서는 사용하지 않습니다.
-- `KIS_DEMO_ACCOUNT_NO` 또는 `KIS_REAL_ACCOUNT_NO`에는 secret을 넣으면 안 됩니다. 계좌번호만 넣습니다.
-- `.env`에서 `#KIS_REAL_APP_KEY=...`처럼 줄이 `#`로 시작하면 주석이라 프로그램이 읽지 않습니다.
-- 실전 주문은 Telegram `/env real`, `TRADING_MODE=live`, `LIVE_TRADING_ENABLED=true`, YAML `live_trading_enabled: true`가 모두 맞아야 시도됩니다.
-
-### OpenAI 키
-
-`OPENAI_API_KEY`는 AI 매매 판단에 사용합니다.
-
-생성 위치:
-
-- OpenAI Platform Dashboard
-- API Keys 또는 Project API Keys
-
-주의:
-
-- 일반 `OPENAI_API_KEY`만 있어도 AI 판단은 동작합니다.
-- 이 키는 비용 조회용 organization costs API 권한이 없을 수 있습니다.
-
-### OpenAI 비용 조회 키
-
-비용 리포트는 OpenAI Usage/Costs API의 `/v1/organization/costs`를 호출합니다.
-
-공식 문서 예시도 `Authorization: Bearer $OPENAI_ADMIN_KEY`를 사용합니다. 즉 비용 조회는 보통 일반 project key가 아니라 **organization admin key**가 필요합니다.
-
-`OPENAI_ADMIN_KEY` 발급 조건:
-
-- OpenAI organization owner 권한이 필요합니다.
-- Organization owner만 Admin API key를 만들 수 있습니다.
-
-발급 위치:
-
-```text
-https://platform.openai.com/settings/organization/admin-keys
+```dotenv
+CONFIG_LIVE_TRADING_ENABLED=true
+LIVE_TRADING_ENABLED=true
 ```
 
-발급 후 `.env`에 넣습니다.
+첫 배포에서는 두 값을 `false`로 두고 smoke·상태 점검부터 진행합니다. `CONFIG_LIVE_TRADING_ENABLED`는 YAML 설정의 live gate를 환경변수로 덮어쓰며, `LIVE_TRADING_ENABLED`는 별도의 실행 gate입니다. 둘 중 하나라도 `false`이면 broker 주문 제출은 차단됩니다. demo 주문은 `TRADING_MODE=micro_live` 또는 `live`, real 주문은 `TRADING_MODE=live`여야 합니다.
 
-```text
-OPENAI_ADMIN_KEY=sk-admin-...
-```
+기타 설정 의미:
 
-`OPENAI_USAGE_API_KEY`는 OpenAI의 별도 공식 키 타입이 아닙니다. 이 프로젝트에서 비용 조회 전용 키를 구분해서 넣고 싶을 때 쓰는 alias입니다. 값은 admin key를 넣으면 됩니다.
+- `KIS_ENV=demo`는 smoke와 단발 CLI의 모의계좌 대상을 선택합니다. 장기 실행 `trading-service`의 현재 대상은 SQLite runtime environment이며 Telegram `/env`로 관리합니다. `KIS_REAL_*` 값은 모의 BUY/SELL 검증 전 입력하지 않는 것을 권장합니다.
+- `OPENAI_API_KEY`는 `AUTO_TRADE_AI=openai`일 때 필요합니다. `AUTO_TRADE_AI=rule`은 규칙 기반 dry-run용입니다.
+- `OPENAI_ADMIN_KEY` 또는 `OPENAI_USAGE_API_KEY`는 `/cost`와 비용 줄을 조회할 때만 선택적으로 사용합니다. 비용 키가 없다고 주문 판단 기능이 자동으로 중단되지는 않습니다.
+- `AUTO_TRADE_COLLECT_SECONDS=50`은 현재 Docker Compose 기본값이자 장기 서비스 권장 수집 시간입니다. 이전 배포본에서 10초를 명시했다면 Portainer Stack 환경변수를 `50`으로 갱신하세요.
+- `BUY_ORDER_TTL_SECONDS=60`, `SELL_ORDER_TTL_SECONDS=30`은 미체결 취소 기준입니다.
+- `TELEGRAM_ALLOWED_CHAT_ID`가 없으면 Telegram 제어와 알림을 사용할 수 없습니다. 허용되지 않은 chat id의 명령은 처리하지 않습니다.
 
-```text
-OPENAI_USAGE_API_KEY=sk-admin-...
-```
+자세한 변수 목록의 기준은 저장소의 `.env.example`입니다. `.env`는 Git에 추가하지 않습니다.
 
-권장:
+## Docker 실행
 
-- 가능하면 비용 조회 전용 admin key를 따로 만들고 이름을 `KIS AI Scalper Usage`처럼 구분합니다.
-- 비용 조회가 필요 없으면 넣지 않아도 됩니다.
-- 없으면 리포트에 `openai cost: unavailable (OPENAI_ADMIN_KEY missing)`으로 표시됩니다.
-
-공식 문서:
-
-- OpenAI Usage/Costs API: https://platform.openai.com/docs/api-reference/usage
-- OpenAI Admin API Keys: https://platform.openai.com/docs/api-reference/admin-api-keys
-
-### Telegram 키
-
-필요한 값:
-
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_ALLOWED_CHAT_ID`
-
-Telegram BotFather에서 bot token을 만들고, 본인 chat id만 `TELEGRAM_ALLOWED_CHAT_ID`에 넣습니다. 허용되지 않은 chat id의 명령은 무시됩니다.
-
-## 설치와 테스트
-
-로컬:
+이미지 빌드와 기본 운영 서비스 시작:
 
 ```powershell
-python -m pip install -e ".[dev]"
-python -m pytest --basetemp .tmp_pytest_monday
+docker compose build trading-service
+docker compose up -d trading-service
+docker compose ps
+docker compose logs -f trading-service
 ```
 
-Docker:
-
-```powershell
-docker compose build app
-docker compose run --rm app
-```
-
-현재 검증 기준:
+`trading-service`는 시작 알림을 Telegram으로 보내고 `runtime: paused`로 대기합니다. 로그와 Telegram `/status`에서 다음을 확인한 뒤에만 resume합니다.
 
 ```text
-147 passed
+/control
+/env demo
+/positions
+/orders
+/fills
+/resume
 ```
 
-## 월요일 장 시작 전 체크리스트
-
-먼저 테스트:
-
-```powershell
-python -m pytest --basetemp .tmp_pytest_monday
-```
-
-KIS 인증/시세 smoke:
-
-```powershell
-python -m kis_ai_scalper.cli smoke-kis --config config/settings.yaml --env demo --symbol 005930
-python -m kis_ai_scalper.cli smoke-ws --config config/settings.yaml --env demo --symbol 005930 --seconds 10
-```
-
-watchlist 등록:
+watchlist를 DB에 등록하지 않고 `--symbols`를 지정하지 않으면 서비스는 빈 watchlist로 동작합니다.
 
 ```powershell
 python -m kis_ai_scalper.cli watchlist-add --db data/kis_ai_scalper.sqlite3 --symbols 005930
 python -m kis_ai_scalper.cli watchlist-list --db data/kis_ai_scalper.sqlite3
 ```
 
-Telegram 확인:
-
-```powershell
-python -m kis_ai_scalper.cli telegram-poll --db data/kis_ai_scalper.sqlite3 --limit 10 --timeout-seconds 0
-```
-
-런타임 resume:
-
-```powershell
-python -m kis_ai_scalper.cli control-resume --db data/kis_ai_scalper.sqlite3 --reason monday_demo
-```
-
-Telegram에서 `/control`을 열면 현재 environment와 local 미청산 포지션을 확인할 수 있습니다. `/env`는 현재 environment를 보여주고, `/env demo` 또는 `/env real`은 paused 상태에서만 local control DB의 다음 실행 environment를 바꿉니다.
-
-모의계좌 1회 bounded 자동매매:
-
-```powershell
-python -m kis_ai_scalper.cli auto-trade-cycle `
-  --config config/settings.yaml `
-  --env demo `
-  --db data/kis_ai_scalper.sqlite3 `
-  --symbols 005930 `
-  --collect-seconds 10 `
-  --ai openai `
-  --max-quantity 1 `
-  --notify-telegram `
-  --confirm AUTO_TRADE
-```
-
-예상 동작:
-
-- 조건이 안 맞으면 주문 없음
-- KRX 캘린더상 장이 닫혀 있으면 주문 없음
-- AI가 HOLD면 주문 없음
-- AI가 HIGH risk로 판단하면 주문 없이 승인 요청 기록
-- 정상 BUY 판단 + risk 통과 시 1주 BUY 제출
-- 기존 포지션이 손절/익절/타임스탑 조건이면 SELL 제출
-- 전일에 열린 local live position이 남아 있으면 신규 진입보다 먼저 SELL 제출
-
-문제가 있으면 Telegram에서 즉시:
-
-```text
-/pause
-```
-
-## 주요 CLI
-
-상태:
-
-```powershell
-python -m kis_ai_scalper.cli control-status --db data/kis_ai_scalper.sqlite3
-```
-
-일시정지:
-
-```powershell
-python -m kis_ai_scalper.cli control-pause --db data/kis_ai_scalper.sqlite3 --reason operator_pause
-```
-
-재개:
-
-```powershell
-python -m kis_ai_scalper.cli control-resume --db data/kis_ai_scalper.sqlite3 --reason operator_ready
-```
-
-watchlist:
-
-```powershell
-python -m kis_ai_scalper.cli watchlist-add --db data/kis_ai_scalper.sqlite3 --symbols 005930,000660
-python -m kis_ai_scalper.cli watchlist-remove --db data/kis_ai_scalper.sqlite3 --symbols 000660
-python -m kis_ai_scalper.cli watchlist-list --db data/kis_ai_scalper.sqlite3
-```
-
-리포트:
-
-```powershell
-python -m kis_ai_scalper.cli paper-report --db data/kis_ai_scalper.sqlite3
-```
-
-Telegram polling:
-
-```powershell
-python -m kis_ai_scalper.cli telegram-poll --db data/kis_ai_scalper.sqlite3 --limit 10 --timeout-seconds 5
-```
-
-자동매매 dry-run AI:
-
-```powershell
-python -m kis_ai_scalper.cli auto-trade-cycle `
-  --config config/settings.yaml `
-  --env demo `
-  --db data/kis_ai_scalper.sqlite3 `
-  --symbols 005930 `
-  --ai rule `
-  --max-quantity 1 `
-  --confirm AUTO_TRADE
-```
-
-자동매매 OpenAI:
-
-```powershell
-python -m kis_ai_scalper.cli auto-trade-cycle `
-  --config config/settings.yaml `
-  --env demo `
-  --db data/kis_ai_scalper.sqlite3 `
-  --symbols 005930 `
-  --collect-seconds 10 `
-  --ai openai `
-  --max-quantity 1 `
-  --notify-telegram `
-  --confirm AUTO_TRADE
-```
-
-## Telegram 명령
-
-지원 명령:
-
-```text
-/pause
-/resume
-/status
-/report
-/cost
-/control
-/env
-/env demo
-/env real
-/positions
-```
-
-`/control`은 inline 버튼을 표시합니다.
-
-버튼:
-
-- Pause
-- Resume
-- Status
-- Paper report
-- OpenAI cost
-- Demo env / Real env (paused only)
-- Positions
-
-`/report`에는 OpenAI 비용 줄도 포함됩니다. 비용 조회 키가 없으면 unavailable로 표시됩니다.
-
-`/status`와 `/positions`는 local SQLite에 기록된 미청산 포지션을 보여줍니다. `trading-service`는 resume 뒤 장중 cycle 전에 KIS 브로커 잔고와 local DB를 대조합니다. 브로커에만 있거나 수량이 다르면 주문을 보류하고 Telegram으로 묻습니다.
-
-키 누락이나 설정 오류:
-
-- `trading-service`는 resume 상태에서 KIS/OpenAI 필수 키가 없거나 live gate가 맞지 않으면 자동으로 pause로 되돌립니다.
-- KIS 잔고조회가 실패하면 service error로 pause합니다.
-- 브로커에만 있거나 수량이 다른 포지션은 pause 대신 주문 cycle을 보류하고 Telegram으로 묻습니다.
-- Telegram이 설정되어 있으면 어떤 값이 빠졌는지 메시지로 보냅니다.
-- Telegram 자체 키가 없으면 콘솔 로그에만 남습니다.
-
-## Portainer 배포
-
-Portainer Stack으로 `docker-compose.yml`을 배포합니다.
-
-Stack 환경변수 예시:
-
-```text
-TRADING_MODE=micro_live
-LIVE_TRADING_ENABLED=true
-KIS_ENV=demo
-AUTO_TRADE_AI=openai
-AUTO_TRADE_MAX_QUANTITY=1
-AUTO_TRADE_COLLECT_SECONDS=10
-AUTO_TRADE_CYCLE_INTERVAL_SECONDS=60
-```
-
-프로젝트 루트의 `.env`를 compose 파일 옆에 둡니다. compose는 `.env`를 `/app/.env`로 read-only mount하고, `./data`를 `/app/data`로 mount합니다.
-
-서비스:
-
-- `app`: 전체 테스트 실행
-- `smoke-kis`: KIS REST/auth smoke
-- `smoke-ws`: KIS WebSocket smoke
-- `collector`: 제한 시간 read-only 시세 수집
-- `telegram-poll`: Telegram 명령 polling, profile `ops`
-- `auto-trade-cycle`: 1회 bounded AI 자동매매 cycle, profile `trade`
-- `trading-service`: 장기 실행 운영 서비스, profile `trade`
-
-첫 모의계좌 장중 테스트는 `trading-service`를 켠 뒤 Telegram `/control`에서 상태를 보고 `/resume`으로 시작합니다. 서비스는 시작 시 항상 paused로 들어갑니다.
-
-`trading-service`는 같은 `./data:/app/data` 볼륨에 runtime state와 포지션 기록을 남깁니다. Docker 작업 시작 후 Telegram `/status`에서 `paused`, `environment`, 포지션 수를 확인하고, 포지션 대조가 끝난 뒤 `/resume`합니다.
-
-## Docker Compose 사용
-
-테스트:
-
-```powershell
-docker compose run --rm app
-```
-
-KIS smoke:
-
-```powershell
-docker compose run --rm smoke-kis
-docker compose run --rm smoke-ws
-```
-
-collector:
-
-```powershell
-docker compose run --rm collector
-```
-
-Telegram poll:
-
-```powershell
-docker compose --profile ops run --rm telegram-poll
-```
-
-auto trade one-shot:
+단일 bounded cycle을 직접 실행할 수도 있지만, 장기 운영에서는 `trading-service`와 중복 주문이 생기지 않도록 동시에 실행하지 않습니다.
 
 ```powershell
 docker compose --profile trade run --rm auto-trade-cycle
 ```
 
-장기 실행 서비스:
+## Telegram 운영
 
-```powershell
-docker compose --profile trade up -d trading-service
-```
-
-운영 시작:
+주요 명령:
 
 ```text
-/control
-/env demo
-/positions
-/resume
+/control          현재 상태와 제어 버튼
+/status           paused, environment, heartbeat, 불일치 플래그
+/pause [reason]   즉시 일시정지
+/resume [reason]  재개. real은 별도 arm 필요
+/env              현재 환경 확인
+/env demo         paused 상태에서 demo 선택
+/env real         real challenge 발급, 아직 환경 변경 안 함
+/confirm-real 123456
+/positions        local/live 또는 broker snapshot 포지션
+/orders           최근 broker 주문
+/fills            최근 broker 체결
+/approvals        대기 중인 고위험 승인
+/approve <id>
+/reject <id>
+/report           paper 또는 live 리포트
+/live-report      최근 broker snapshot
+/cost             OpenAI 비용 조회
+/emergency-stop   pause와 emergency stop 활성화
+/clear-emergency  paused 상태에서 emergency stop 해제
 ```
 
-## GitHub
+real 전환 순서:
 
-현재 작업 브랜치:
+1. `/pause` 상태인지 확인합니다. local open position 또는 active/unknown broker order가 있으면 환경 전환이 거부됩니다.
+2. `/env real`을 입력합니다. 6자리 숫자 challenge가 발급되고 5분 동안 유효합니다.
+3. `/confirm-real <challenge>`를 paused 상태에서 입력합니다. 성공하면 real 환경이 선택되고 15분 동안 1회 resume arm이 생깁니다.
+4. 키·계정·`TRADING_MODE=live`·두 live gate를 확인한 뒤 `/resume`을 한 번만 입력합니다.
 
-```text
-codex/ai-auto-trading-readiness
-```
+real에서 pause하거나 emergency stop을 사용하면 다시 resume하기 전에 새 challenge 확인이 필요합니다. 이는 환경을 바꾸는 `/env`만이 아니라 real resume 자체에 적용됩니다.
+
+## 주문과 잔고 불일치 처리
+
+장중 cycle은 대략 다음 순서로 동작합니다.
+
+1. KIS 주문 상태와 계좌 snapshot을 읽습니다.
+2. local 주문에 대응하는 KIS 주문만 ledger에 반영합니다. broker-only 체결·잔고는 자동으로 local position으로 만들지 않습니다.
+3. local position과 broker position의 수량이 다르거나 한쪽에만 있으면 `operator_review=true`, `block_new_entries=true`를 기록합니다.
+4. 이 상태에서는 신규 BUY를 차단하고 Telegram에 원인을 보냅니다. runtime을 자동 pause로 바꾸지는 않지만, 운영자는 원인 확인 전 `/pause`를 유지해야 합니다.
+5. local position을 불일치 해소용으로 자동 청산하지 않습니다. 외부 수동 주문, 재시작 중 체결, 계좌·주문 조회 장애를 확인하고 ledger와 KIS 상태를 운영자가 대조합니다.
+
+미체결 주문 취소도 같은 원칙을 따릅니다. BUY 60초, SELL 30초가 지나면 취소 요청을 한 번 보내고, KIS가 `CANCELLED`, `FILLED`, `REJECTED` 중 하나를 보고할 때까지 신규진입을 다시 평가하지 않습니다. 취소 요청이 애매하거나 주문 식별자가 맞지 않으면 `UNKNOWN`으로 남기고 신규진입을 차단합니다.
+
+## 월요일 모의계좌 1주 검증
+
+이 절차는 실전 전환 승인이 아니라 **demo 장중 동작을 확인하는 1주 운영 절차**입니다. 첫 주문 수량은 `AUTO_TRADE_MAX_QUANTITY=1`로 고정합니다.
+
+월요일 장 시작 전:
+
+1. `.env`에 demo 키·계좌와 Telegram 허용 chat id를 입력하고 `KIS_ENV=demo`, `TRADING_MODE=micro_live`를 확인합니다. 주문 게이트는 검증 단계에 맞춰 두 값을 먼저 `false`로 둡니다.
+2. `data/`를 백업하고 기존 local position, broker 잔고, active order가 없는지 확인합니다.
+3. `docker compose up -d trading-service`로 시작합니다. 서비스가 paused로 시작하는지 로그와 `/status`로 확인합니다.
+4. KIS REST/WebSocket smoke와 watchlist를 확인합니다. KRX 휴장일이면 주문이 없는 것이 정상입니다.
+5. demo 주문을 검증할 시점에만 `CONFIG_LIVE_TRADING_ENABLED=true`, `LIVE_TRADING_ENABLED=true`를 설정하고 서비스를 재시작합니다. 재시작 후에도 서비스는 다시 paused로 시작합니다.
+6. `/control`, `/env demo`, `/positions`, `/orders`, `/fills`를 확인한 뒤 `/resume`합니다.
+
+월요일부터 금요일까지 장중:
+
+- 매일 시작 시 paused·environment·heartbeat·`operator_review`·`block_new_entries`를 확인합니다.
+- 후보, HOLD, risk reject는 주문 없음으로 기록합니다. 고위험 BUY는 `/approvals`에서 조건과 만료 시각을 확인하고 필요한 경우에만 승인합니다.
+- BUY 미체결 60초, SELL 미체결 30초 취소가 KIS 상태 재조회로 확정되는지 확인합니다.
+- broker-only, local-only, 수량 불일치가 발생하면 신규진입을 허용하지 않고 원인을 기록합니다. 자동 채택·자동 청산으로 덮어쓰지 않습니다.
+- 장 마감 후 `/report`, `/live-report`, `/orders`, `/fills`를 저장하고 data 백업을 갱신합니다.
+
+금요일 검토:
+
+- 실제 KIS demo 접수·체결·취소·부분 체결 응답과 local ledger가 일치하는지 확인합니다.
+- Telegram pause/resume, approval 만료, 불일치 알림, service restart 후 pause 동작을 확인합니다.
+- 실패·미확인 항목이 있으면 real로 전환하지 않습니다. 이 저장소의 문서 상태는 계속 “코드 준비 완료, 장중 모의 검증 필요”로 둡니다.
+
+## 데이터 영속화와 백업
+
+Compose는 `${DATA_DIR:-./data}`를 컨테이너 `/app/data`에 연결합니다. SQLite, `auth/` token cache, runtime metadata, 주문·체결 ledger가 이 경로에 저장되므로 운영 호스트의 영속 디스크를 사용해야 합니다.
+
+SQLite 파일을 복사할 때는 일관성을 위해 먼저 서비스를 멈춥니다.
 
 ```powershell
-git push -u origin codex/ai-auto-trading-readiness
+docker compose stop trading-service
+Copy-Item -Recurse -Force .\data .\backup\data-$(Get-Date -Format yyyyMMdd-HHmmss)
+docker compose up -d trading-service
 ```
 
-## 참고
+백업에는 token cache가 포함될 수 있으므로 접근권한을 제한하고 외부 저장소에 평문으로 공개하지 않습니다. 복원도 서비스를 멈춘 상태에서 수행하고, 복원 후 `/status`와 broker 잔고를 다시 대조합니다.
 
-- KIS 공식 샘플: https://github.com/koreainvestment/open-trading-api
-- exchange_calendars XKRX: https://github.com/gerrymanoim/exchange_calendars
-- OpenAI Usage/Costs API: https://platform.openai.com/docs/api-reference/usage
-- OpenAI Admin API Keys: https://platform.openai.com/docs/api-reference/admin-api-keys
+## 로컬 테스트와 smoke
+
+```powershell
+python -m pip install -e ".[dev]"
+python -m pytest --basetemp .tmp_pytest_monday
+python -m kis_ai_scalper.cli smoke-kis --config config/settings.yaml --env demo --symbol 005930
+python -m kis_ai_scalper.cli smoke-ws --config config/settings.yaml --env demo --symbol 005930 --seconds 10
+```
+
+테스트 결과 수치는 커밋·환경에 따라 달라질 수 있으므로 이 문서에 고정된 과거 통과 개수는 기록하지 않습니다. smoke와 테스트 통과만으로 장중 주문 검증이나 실전 검증을 대신할 수 없습니다.
+
+## 참고 문서
+
+- [Portainer Git Stack 운영 절차](docs/PORTAINER.md)
+- KIS Open API 공식 샘플: https://github.com/koreainvestment/open-trading-api
+- `exchange_calendars` XKRX: https://github.com/gerrymanoim/exchange_calendars
+- OpenAI Usage API: https://platform.openai.com/docs/api-reference/usage

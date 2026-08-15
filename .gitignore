@@ -4,6 +4,10 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .tmp_pytest*/
+.tmp_agent*/
+.tmp_main_*/
+.tmp_reconciliation*/
+.tmp*/
 .venv/
 .env
 .env.*

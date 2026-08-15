@@ -21,6 +21,7 @@ def test_config_defaults_to_shadow_and_loads_api_credentials_without_account():
         },
     )
     assert config.mode is TradingMode.SHADOW
+    assert config.live_trading_enabled is False
     assert config.kis_api_for("demo") is not None
     assert config.kis_api_for("demo").app_secret == "test-secret"
     assert config.kis_account_for("demo") is None
@@ -135,3 +136,11 @@ def test_live_mode_requires_explicit_gate(tmp_path):
         {"TRADING_MODE": "live", "LIVE_TRADING_ENABLED": "true"},
     )
     assert config.mode is TradingMode.LIVE
+
+
+def test_config_live_trading_enabled_can_be_overridden_by_environment():
+    enabled = load_config(CONFIG, {"CONFIG_LIVE_TRADING_ENABLED": "true"})
+    disabled = load_config(CONFIG, {"CONFIG_LIVE_TRADING_ENABLED": "false"})
+
+    assert enabled.live_trading_enabled is True
+    assert disabled.live_trading_enabled is False

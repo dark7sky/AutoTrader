@@ -103,8 +103,13 @@ def load_config(path: str | Path, environ: dict[str, str] | None = None) -> AppC
     raw = dict(raw)
     raw["mode"] = env.get("TRADING_MODE", raw.get("mode", TradingMode.SHADOW.value))
     yaml_live_trading_enabled = raw.get("live_trading_enabled", False)
+    config_live_trading_enabled = env.get("CONFIG_LIVE_TRADING_ENABLED")
     env_live_trading_enabled = env.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
-    raw["live_trading_enabled"] = yaml_live_trading_enabled
+    raw["live_trading_enabled"] = (
+        config_live_trading_enabled.lower() == "true"
+        if config_live_trading_enabled is not None
+        else yaml_live_trading_enabled
+    )
     demo_secret_names = ("KIS_DEMO_APP_KEY", "KIS_DEMO_APP_SECRET")
     real_secret_names = ("KIS_REAL_APP_KEY", "KIS_REAL_APP_SECRET")
     if all(env.get(name) for name in demo_secret_names):

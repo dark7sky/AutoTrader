@@ -4,16 +4,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import json
+import math
 import os
 import sys
+import threading
 import time
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from kis_ai_scalper.broker.kis_auth import KisAuthClient, redact
 from kis_ai_scalper.broker.kis_balance import KisBalanceClient
 from kis_ai_scalper.broker.kis_endpoints import KisEnvironment
 from kis_ai_scalper.broker.kis_order import KisOrderClient
+from kis_ai_scalper.broker.kis_order import KisOrderRequest, KisOrderSide
+from kis_ai_scalper.broker.kis_order_status import KisOrderStatusClient
+from kis_ai_scalper.broker.kis_account import KisAccountClient, KisAccountSnapshot
+from kis_ai_scalper.broker.kis_buying_power import KisBuyingPowerClient, KisBuyingPowerSnapshot
+from kis_ai_scalper.broker.kis_realized_pnl import (
+    KisRealizedPnlClient,
+    KisRealizedPnlSnapshot,
+    KisRealizedPnlUnsupportedError,
+)
 from kis_ai_scalper.broker.kis_rest import KisRestClient
 from kis_ai_scalper.broker.kis_endpoints import websocket_url
 from kis_ai_scalper.broker.kis_ws import smoke_realtime_price
@@ -22,9 +37,10 @@ from kis_ai_scalper.schemas.types import TradingMode
 from kis_ai_scalper.ai.decision import OpenAITradingDecisionClient, RuleBasedAIClient
 from kis_ai_scalper.market.clock import kst_now
 from kis_ai_scalper.market.collector import collect_realtime_prices
+from kis_ai_scalper.market.streaming_collector import StreamingCollector
 from kis_ai_scalper.market.features import build_feature_snapshot
 from kis_ai_scalper.market.health import evaluate_market_health
-from kis_ai_scalper.market.schedule import is_regular_market_open
+from kis_ai_scalper.market.schedule import exchange_calendar_available, is_regular_market_open
 from kis_ai_scalper.storage import connect_database
 from kis_ai_scalper.storage.replay import parse_bars_csv, sample_bars
 from kis_ai_scalper.strategies.candidate import scan_candidates
@@ -47,6 +63,20 @@ from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.ops.control import control_status, set_paused
 from kis_ai_scalper.ops.openai_usage import openai_cost_summary_from_env
 from kis_ai_scalper.ops.telegram import TelegramClient, env_value, optional_env_value, poll_telegram
+from kis_ai_scalper.ai.reliable import UsageBudget
+from kis_ai_scalper.pipeline.broker_reconciliation import (
+    ReconciliationReport,
+    reconcile_broker_state,
+)
+from kis_ai_scalper.pipeline.order_management import (
+    OrderManagementConfig,
+    OrderManagementReport,
+    manage_stale_orders,
+)
+from kis_ai_scalper.risk.portfolio_snapshot import (
+    PortfolioRiskSnapshot,
+    build_portfolio_risk_snapshot,
+)
 
 
 def _kis_api_for(config, environment: KisEnvironment):
@@ -324,6 +354,128 @@ def telegram_poll(db_path: str, bot_token_env: str, allowed_chat_id_env: str,
     )
 
 
+SERVICE_LEASE_NAME = "trading-service"
+SERVICE_LEASE_TTL_SECONDS = 180
+RETENTION_LAST_DAY_KEY = "market_retention:last_cleanup_day"
+LIVE_REPORT_KEY = "live_report_snapshot"
+SERVICE_ALERT_THROTTLE = timedelta(minutes=15)
+PREFLIGHT_ALERT_FINGERPRINT_KEY = "service:preflight_alert:fingerprint"
+PREFLIGHT_ALERT_AT_KEY = "service:preflight_alert:at"
+ORDER_MANAGEMENT_ALERT_FINGERPRINT_KEY = "service:order_management_alert:fingerprint"
+ORDER_MANAGEMENT_ALERT_AT_KEY = "service:order_management_alert:at"
+
+
+def _env_number(name: str, default: float, *, integer: bool = False,
+                minimum: float | None = None, maximum: float | None = None) -> float | int:
+    raw = optional_env_value(name)
+    if raw is None:
+        return int(default) if integer else float(default)
+    try:
+        value = int(raw, 10) if integer else float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a {'integer' if integer else 'number'}") from exc
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum:g}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum:g}")
+    return value
+
+
+def _risk_config_from_env():
+    defaults = RiskConfig()
+    return RiskConfig(
+        allocated_krw=float(_env_number("AUTO_TRADE_ALLOCATED_KRW", defaults.allocated_krw, minimum=0.01)),
+        risk_per_trade_pct=float(_env_number("RISK_PER_TRADE_PCT", defaults.risk_per_trade_pct, minimum=0.01, maximum=100)),
+        max_position_pct=float(_env_number("MAX_POSITION_PCT", defaults.max_position_pct, minimum=0.01, maximum=100)),
+        max_total_exposure_pct=float(_env_number("MAX_TOTAL_EXPOSURE_PCT", defaults.max_total_exposure_pct, minimum=0.01, maximum=100)),
+        max_positions=int(_env_number("MAX_POSITIONS", defaults.max_positions, integer=True, minimum=1)),
+        max_daily_loss_pct=float(_env_number("MAX_DAILY_LOSS_PCT", defaults.max_daily_loss_pct, minimum=0, maximum=100)),
+        consecutive_loss_limit=int(_env_number("CONSECUTIVE_LOSS_LIMIT", defaults.consecutive_loss_limit, integer=True, minimum=1)),
+        max_trades_per_day=int(_env_number("MAX_TRADES_PER_DAY", defaults.max_trades_per_day, integer=True, minimum=1)),
+        max_orders_per_symbol=int(_env_number("MAX_ORDERS_PER_SYMBOL", defaults.max_orders_per_symbol, integer=True, minimum=1)),
+        minimum_confidence=float(_env_number("AI_MIN_CONFIDENCE", defaults.minimum_confidence, minimum=0, maximum=1)),
+    )
+
+
+def _auto_trade_config_from_env(max_quantity: int) -> AutoTradeConfig:
+    risk = _risk_config_from_env()
+    return AutoTradeConfig(
+        risk=risk,
+        max_quantity=max_quantity,
+        min_confidence=risk.minimum_confidence,
+    )
+
+
+def _usage_budget_from_env() -> UsageBudget:
+    return UsageBudget(
+        max_process_calls=int(_env_number("OPENAI_MAX_PROCESS_CALLS", 500, integer=True, minimum=0)),
+        max_daily_calls=int(_env_number("OPENAI_MAX_DAILY_CALLS", 1000, integer=True, minimum=0)),
+        max_process_cost_usd=float(_env_number("OPENAI_MAX_PROCESS_COST_USD", 10.0, minimum=0)),
+        max_daily_cost_usd=float(_env_number("OPENAI_MAX_DAILY_COST_USD", 25.0, minimum=0)),
+    )
+
+
+def _lease_is_active(db_path: str, *, owner_id: str | None = None,
+                     now: datetime | None = None) -> bool:
+    current = now or datetime.now().astimezone()
+    with connect_database(db_path) as database:
+        database.init_schema()
+        lease = database.get_service_lease(SERVICE_LEASE_NAME)
+    if lease is None or str(lease["owner_id"]) == owner_id:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(str(lease["expires_at"]))
+    except ValueError:
+        return True
+    if expires_at.tzinfo is None:
+        return True
+    return expires_at > current
+
+
+def _cleanup_market_data(database, now: datetime, *, tick_days: int = 7,
+                         bar_days: int = 365) -> tuple[int, int] | None:
+    """Run retention once per KST day; a failed cleanup never reaches orders."""
+    kst = timezone(timedelta(hours=9), "KST")
+    aware_now = now if now.tzinfo is not None else now.replace(tzinfo=kst)
+    day = aware_now.astimezone(kst).date().isoformat()
+    if database.get_runtime_metadata(RETENTION_LAST_DAY_KEY) == day:
+        return None
+    tick_count = database.delete_old_ticks(aware_now - timedelta(days=tick_days))
+    bar_count = database.delete_old_bars(aware_now - timedelta(days=bar_days))
+    database.set_runtime_metadata(RETENTION_LAST_DAY_KEY, day, updated_at=now)
+    return tick_count, bar_count
+
+
+def _sanitized_live_report(environment: KisEnvironment, account: KisAccountSnapshot,
+                           portfolio: PortfolioRiskSnapshot | None,
+                           reconciliation: ReconciliationReport | None,
+                           observed_at: datetime) -> str:
+    positions = []
+    for position in account.positions:
+        positions.append({
+            "symbol": position.symbol,
+            "qty": position.qty,
+            "sellable_qty": position.sellable_qty,
+            "current_price": position.current_price,
+            "evaluation_pnl": position.evaluation_pnl,
+        })
+    payload = {
+        "environment": environment.value,
+        "observed_at": observed_at.isoformat(),
+        "positions": positions,
+        "cash": account.summary.deposit,
+        "orderable_cash": account.summary.orderable_cash_estimate,
+        "total_evaluation": account.summary.total_evaluation,
+        "evaluation_pnl": account.summary.evaluation_pnl,
+        "daily_pnl": None if portfolio is None else portfolio.portfolio.daily_pnl_krw,
+        "unknown_fields": [] if portfolio is None else sorted(portfolio.unknown_fields),
+        "reconcile_reasons": [] if reconciliation is None else list(reconciliation.reasons),
+    }
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
 def _runtime_preflight(config_path: str, environment: KisEnvironment, ai: str) -> list[str]:
     errors: list[str] = []
     try:
@@ -334,6 +486,8 @@ def _runtime_preflight(config_path: str, environment: KisEnvironment, ai: str) -
         ("kis_api", lambda: _kis_api_for(config, environment)),
         ("kis_account", lambda: _kis_account_for(config, environment)),
         ("broker_gate", lambda: _assert_broker_order_allowed(config, environment)),
+        ("exchange_calendar", lambda: _assert_exchange_calendar_available()),
+        ("risk_config", _risk_config_from_env),
     ):
         try:
             check()
@@ -342,6 +496,11 @@ def _runtime_preflight(config_path: str, environment: KisEnvironment, ai: str) -
     if ai == "openai" and optional_env_value("OPENAI_API_KEY") is None:
         errors.append("openai: OPENAI_API_KEY is required when AUTO_TRADE_AI=openai")
     return errors
+
+
+def _assert_exchange_calendar_available() -> None:
+    if not exchange_calendar_available():
+        raise RuntimeError("exchange calendar is unavailable; broker trading is fail-closed")
 
 
 def _reconcile_broker_positions(
@@ -384,16 +543,7 @@ def _reconcile_broker_positions(
         if broker[symbol] != local[symbol]
     )
     if local_only:
-        with connect_database(db_path) as database:
-            database.init_schema()
-            for symbol in local_only:
-                for position in database.list_open_live_positions(symbol):
-                    database.close_live_position(
-                        position_id=str(position["position_id"]),
-                        exit_broker_order_id=None,
-                        close_reason="broker_position_missing",
-                    )
-        messages.append("local_positions_closed=" + ",".join(
+        messages.append("operator_review_local_position_only=" + ",".join(
             f"{symbol}:{local[symbol]}" for symbol in local_only
         ))
     if broker_only:
@@ -404,7 +554,7 @@ def _reconcile_broker_positions(
         messages.append("operator_review_quantity_mismatch=" + ",".join(
             f"{symbol}:broker={broker[symbol]}:local={local[symbol]}" for symbol in mismatched
         ))
-    requires_operator = bool(broker_only or mismatched)
+    requires_operator = bool(local_only or broker_only or mismatched)
     return not requires_operator, messages
 
 
@@ -423,88 +573,151 @@ def service_loop(
 ) -> int:
     if cycle_interval_seconds < 1:
         raise ValueError("cycle_interval_seconds must be positive")
-    if pause_on_start:
-        set_paused(db_path, True, "service_start_default_pause", "service")
+    owner_id = uuid4().hex
     notifier = _telegram_notifier_from_env()
-    last_reconciliation_message = ""
-    last_reconciliation_alert_at = 0.0
-    if notifier is not None:
-        notifier.send(
-            "auto-trade service started\n"
-            "runtime: paused\n"
-            "Use /control then Resume after env/positions are checked."
-        )
-    print("service-loop: started")
-    while True:
-        started = time.monotonic()
+    telegram_poll_stop = threading.Event()
+    telegram_poll_failed = threading.Event()
+    telegram_poll_thread: threading.Thread | None = None
+    with connect_database(db_path) as lease_database:
+        lease_database.init_schema()
+        lease_database.record_heartbeat("trading-service", heartbeat_at=datetime.now().astimezone())
+        if not lease_database.acquire_service_lease(
+            SERVICE_LEASE_NAME, owner_id, SERVICE_LEASE_TTL_SECONDS,
+        ):
+            raise RuntimeError("another trading-service instance already holds the service lease")
+        # A service restart always requires an explicit operator resume.
+        lease_database.set_runtime_paused(True, "service_start_default_pause", "service")
         try:
+            if notifier is not None:
+                try:
+                    notifier.send(
+                        "auto-trade service started\n"
+                        "runtime: paused\n"
+                        "Use /control then Resume after env/positions are checked."
+                    )
+                except Exception as exc:
+                    print(f"service startup notification warning: {type(exc).__name__}", file=sys.stderr)
+
             token = optional_env_value("TELEGRAM_BOT_TOKEN")
             chat_id = optional_env_value("TELEGRAM_ALLOWED_CHAT_ID")
             if token and chat_id:
-                poll_telegram(
-                    db_path, token, chat_id,
-                    limit=telegram_limit,
-                    timeout_seconds=telegram_timeout_seconds,
-                    client=TelegramClient(token),
+                telegram_poll_thread = threading.Thread(
+                    target=_telegram_poll_worker,
+                    kwargs={
+                        "db_path": db_path,
+                        "token": token,
+                        "chat_id": chat_id,
+                        "limit": telegram_limit,
+                        "timeout_seconds": telegram_timeout_seconds,
+                        "stop_event": telegram_poll_stop,
+                        "failed_event": telegram_poll_failed,
+                    },
+                    name="telegram-poll",
+                    daemon=True,
                 )
-            control = control_status(db_path)
-            if control.paused:
-                print(f"service-loop: paused environment={control.environment}")
-                _sleep_remaining(started, cycle_interval_seconds)
-                continue
-            now = kst_now()
-            if not is_regular_market_open(now):
-                print(f"service-loop: market_closed environment={control.environment}")
-                _sleep_remaining(started, cycle_interval_seconds)
-                continue
-            env = KisEnvironment.parse(control.environment)
-            errors = _runtime_preflight(config_path, env, ai)
-            if errors:
-                set_paused(db_path, True, "preflight_failed", "service")
-                message = "auto-trade paused: setup issue\n" + "\n".join(f"- {item}" for item in errors)
-                print(message)
-                _notify_operator_if_possible(message)
-                _sleep_remaining(started, cycle_interval_seconds)
-                continue
-            reconciliation_ok, reconciliation_messages = _reconcile_broker_positions(
-                config_path, env, db_path, refresh_token,
-            )
-            if reconciliation_messages:
-                message = (
-                    "position reconciliation\n"
-                    + "\n".join(f"- {item}" for item in reconciliation_messages)
-                )
-                print(message)
-                if (
-                    message != last_reconciliation_message
-                    or time.monotonic() - last_reconciliation_alert_at > 300
-                ):
-                    last_reconciliation_message = message
-                    last_reconciliation_alert_at = time.monotonic()
-                    _notify_operator_if_possible(
-                        message
-                        + "\nIf operator_review is shown, decide manually. "
-                        "Use /positions and broker app, then /pause if you want to stop service."
+                telegram_poll_thread.start()
+
+            shared_ai_client = None
+            if ai == "openai":
+                try:
+                    shared_ai_client = OpenAITradingDecisionClient(
+                        env_value("OPENAI_API_KEY"),
+                        model=optional_env_value("OPENAI_MODEL") or "gpt-4o-mini",
+                        budget=_usage_budget_from_env(),
                     )
-            if not reconciliation_ok:
-                print("service-loop: reconciliation_pending broker_orders=none")
+                except Exception as exc:
+                    _notify_operator_if_possible(f"AI setup warning: {type(exc).__name__}")
+
+            print("service-loop: started")
+            last_alert = ""
+            last_alert_at = 0.0
+            while True:
+                started = time.monotonic()
+                poll_failed = telegram_poll_failed.is_set()
+                try:
+                    now = kst_now()
+                    lease_database.record_heartbeat("trading-service", heartbeat_at=datetime.now().astimezone())
+                    if not lease_database.renew_service_lease(
+                        SERVICE_LEASE_NAME, owner_id, SERVICE_LEASE_TTL_SECONDS,
+                    ):
+                        raise RuntimeError("trading-service lease renewal failed")
+                    try:
+                        tick_days = int(_env_number("MARKET_TICK_RETENTION_DAYS", 7, integer=True, minimum=1))
+                        bar_days = int(_env_number("MARKET_BAR_RETENTION_DAYS", 365, integer=True, minimum=1))
+                        _cleanup_market_data(lease_database, now, tick_days=tick_days, bar_days=bar_days)
+                    except Exception as exc:
+                        warning = f"market retention warning: {type(exc).__name__}"
+                        lease_database.set_runtime_metadata("market_retention:last_error", warning, updated_at=now)
+                        print(warning, file=sys.stderr)
+
+                    control = control_status(db_path)
+                    env = KisEnvironment.parse(control.environment)
+                    errors = _runtime_preflight(config_path, env, ai)
+                    if errors:
+                        set_paused(db_path, True, "preflight_failed", "service")
+                        message = "auto-trade paused: setup issue\n" + "\n".join(f"- {item}" for item in errors)
+                        print(message)
+                        _send_throttled_service_alert(
+                            lease_database,
+                            message,
+                            now=now,
+                            fingerprint_key=PREFLIGHT_ALERT_FINGERPRINT_KEY,
+                            sent_at_key=PREFLIGHT_ALERT_AT_KEY,
+                        )
+                        _sleep_remaining(started, cycle_interval_seconds)
+                        continue
+                    if control.paused:
+                        print(f"service-loop: paused environment={control.environment}")
+                        _sleep_remaining(started, cycle_interval_seconds)
+                        continue
+                    if not is_regular_market_open(now):
+                        print(f"service-loop: market_closed environment={control.environment}")
+                        _sleep_remaining(started, cycle_interval_seconds)
+                        continue
+
+                    symbols = _parse_symbols(symbols_text) if symbols_text else []
+                    if not symbols:
+                        with connect_database(db_path) as database:
+                            database.init_schema()
+                            symbols = database.list_watchlist_symbols()
+                    state = _make_broker_cycle_state(
+                        config_path, env, db_path, symbols, refresh_token,
+                    )
+                    _notify_order_management_alert(lease_database, state.order_management, now=now)
+                    if state.reconciliation.reasons:
+                        message = "broker reconciliation\n" + "\n".join(
+                            f"- {reason}" for reason in state.reconciliation.reasons
+                        )
+                        if message != last_alert or time.monotonic() - last_alert_at > 300:
+                            last_alert, last_alert_at = message, time.monotonic()
+                            _notify_operator_if_possible(message + "\nNew entries are blocked; runtime is not auto-paused.")
+                    cycle_control = control
+                    if telegram_poll_failed.is_set() or state.portfolio.fail_closed:
+                        cycle_control = replace(control, paused=True, reason="entry_gate_blocked")
+                    auto_trade_cycle(
+                        config_path, env.value, symbols_text, db_path, ai,
+                        max_quantity, collect_seconds, "AUTO_TRADE",
+                        notify_telegram=notifier is not None,
+                        refresh_token=refresh_token,
+                        shared_ai_client=shared_ai_client,
+                        service_owner_id=owner_id,
+                        portfolio=state.portfolio,
+                        buying_power_client=state.buying_power_client,
+                        runtime_control_override=cycle_control,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    message = f"service cycle warning: {type(exc).__name__}"
+                    print(message, file=sys.stderr)
+                    lease_database.set_runtime_metadata("service:last_error", message, updated_at=kst_now())
+                    _notify_operator_if_possible(message)
                 _sleep_remaining(started, cycle_interval_seconds)
-                continue
-            auto_trade_cycle(
-                config_path, env.value, symbols_text, db_path, ai,
-                max_quantity, collect_seconds, "AUTO_TRADE",
-                notify_telegram=notifier is not None,
-                refresh_token=refresh_token,
-            )
-        except Exception as exc:
-            try:
-                set_paused(db_path, True, "service_error", "service")
-            except Exception:
-                pass
-            message = f"auto-trade paused: service error\n{type(exc).__name__}: {exc}"
-            print(message, file=sys.stderr)
-            _notify_operator_if_possible(message)
-        _sleep_remaining(started, cycle_interval_seconds)
+        finally:
+            telegram_poll_stop.set()
+            if telegram_poll_thread is not None:
+                telegram_poll_thread.join(timeout=max(1.0, telegram_timeout_seconds + 1.0))
+            lease_database.release_service_lease(SERVICE_LEASE_NAME, owner_id)
 
 
 def _sleep_remaining(started: float, interval_seconds: int) -> None:
@@ -523,6 +736,54 @@ class _TelegramNotifier:
         self.client.send_message(self.chat_id, text)
 
 
+def _telegram_poll_worker(
+    *,
+    db_path: str,
+    token: str,
+    chat_id: str,
+    limit: int,
+    timeout_seconds: int,
+    stop_event: threading.Event,
+    failed_event: threading.Event,
+) -> None:
+    """Poll Telegram independently so operator controls are responsive during collection."""
+
+    while not stop_event.is_set():
+        try:
+            poll_telegram(
+                db_path,
+                token,
+                chat_id,
+                limit=limit,
+                timeout_seconds=timeout_seconds,
+                client=TelegramClient(token),
+            )
+            failed_event.clear()
+            if timeout_seconds == 0:
+                stop_event.wait(0.1)
+        except Exception as exc:
+            failed_event.set()
+            warning = f"telegram poll warning: {type(exc).__name__}"
+            print(warning, file=sys.stderr)
+            try:
+                with connect_database(db_path) as database:
+                    database.init_schema()
+                    database.set_runtime_metadata("telegram:last_error", warning, updated_at=kst_now())
+                    _send_throttled_service_alert(
+                        database,
+                        warning,
+                        now=kst_now(),
+                        fingerprint_key="service:telegram_poll_alert:fingerprint",
+                        sent_at_key="service:telegram_poll_alert:at",
+                    )
+            except Exception as metadata_exc:
+                print(
+                    f"telegram poll state warning: {type(metadata_exc).__name__}",
+                    file=sys.stderr,
+                )
+            stop_event.wait(1.0)
+
+
 def _env_live_trading_enabled() -> bool:
     return env_value("LIVE_TRADING_ENABLED").lower() == "true"
 
@@ -535,16 +796,88 @@ def _telegram_notifier_from_env() -> _TelegramNotifier | None:
     return _TelegramNotifier(token, chat_id)
 
 
-def _notify_operator_if_possible(text: str) -> None:
+def _notify_operator_if_possible(text: str) -> bool:
     notifier = _telegram_notifier_from_env()
-    if notifier is not None:
+    if notifier is None:
+        return False
+    try:
         notifier.send(text)
+    except Exception as exc:
+        print(f"telegram notification warning: {type(exc).__name__}", file=sys.stderr)
+        return False
+    return True
+
+
+def _send_throttled_service_alert(
+    database,
+    message: str,
+    *,
+    now: datetime,
+    fingerprint_key: str,
+    sent_at_key: str,
+) -> bool:
+    """Send one service alert per message every 15 minutes, across restarts."""
+
+    fingerprint = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    previous_fingerprint = database.get_runtime_metadata(fingerprint_key)
+    previous_at = database.get_runtime_metadata(sent_at_key)
+    if previous_fingerprint == fingerprint and previous_at:
+        try:
+            parsed_at = datetime.fromisoformat(previous_at)
+            if parsed_at.tzinfo is None:
+                parsed_at = parsed_at.replace(tzinfo=timezone.utc)
+            current_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+            if current_at.astimezone(timezone.utc) - parsed_at.astimezone(timezone.utc) < SERVICE_ALERT_THROTTLE:
+                return False
+        except ValueError:
+            pass
+
+    if not _notify_operator_if_possible(message):
+        return False
+    database.set_runtime_metadata(fingerprint_key, fingerprint, updated_at=now)
+    database.set_runtime_metadata(sent_at_key, now.isoformat(), updated_at=now)
+    return True
+
+
+def _notify_order_management_alert(
+    database,
+    report: OrderManagementReport,
+    *,
+    now: datetime,
+) -> bool:
+    """Alert on order actions without exposing order identifiers or quantities."""
+
+    events = {
+        (action.action, action.symbol or "unknown", action.reason)
+        for action in report.actions
+        if action.action in {"CANCEL_PENDING", "UNKNOWN", "OPERATOR_REVIEW"}
+    }
+    if report.operator_review:
+        events.add(("OPERATOR_REVIEW", "unknown", "manual_review_required"))
+    if not events:
+        return False
+    lines = [
+        f"- action={action} symbol={symbol} reason={reason}"
+        for action, symbol, reason in sorted(events)
+    ]
+    message = (
+        "order management alert\n"
+        + "\n".join(lines)
+        + "\nNew entries are blocked until operator review."
+    )
+    return _send_throttled_service_alert(
+        database,
+        message,
+        now=now,
+        fingerprint_key=ORDER_MANAGEMENT_ALERT_FINGERPRINT_KEY,
+        sent_at_key=ORDER_MANAGEMENT_ALERT_AT_KEY,
+    )
 
 
 def _assert_broker_order_allowed(config, environment: KisEnvironment) -> None:
     if not (config.live_trading_enabled and _env_live_trading_enabled()):
         raise ValueError(
-            "broker order submission requires YAML live_trading_enabled=true "
+            "broker order submission requires configured live_trading_enabled=true "
             "and LIVE_TRADING_ENABLED=true"
         )
     if environment is KisEnvironment.REAL and config.mode is not TradingMode.LIVE:
@@ -568,6 +901,157 @@ def _account_components(account_no: str, account_product_code: str) -> tuple[str
     if len(digits) != 8:
         raise ValueError("KIS account number must contain eight account digits")
     return digits, account_product_code
+
+
+@dataclass(frozen=True)
+class _BrokerCycleState:
+    order_client: KisOrderClient
+    account_client: KisAccountClient
+    buying_power_client: KisBuyingPowerClient
+    account: KisAccountSnapshot
+    portfolio: PortfolioRiskSnapshot
+    reconciliation: ReconciliationReport
+    order_management: OrderManagementReport
+    realized_pnl: KisRealizedPnlSnapshot | None = None
+
+
+def _make_broker_cycle_state(
+    config_path: str,
+    environment: KisEnvironment,
+    db_path: str,
+    symbols: list[str],
+    refresh_token: bool,
+) -> _BrokerCycleState:
+    config = load_config(Path(config_path))
+    kis_api = _kis_api_for(config, environment)
+    kis_account = _kis_account_for(config, environment)
+    account_no, account_product_code = _account_components(
+        kis_account.account_no, kis_account.account_product_code,
+    )
+    project_root = Path(config_path).resolve().parent.parent
+    cache_path = project_root / "data" / "auth" / f"kis_token_{environment.value}.json"
+    auth_result = KisAuthClient(
+        environment, kis_api.app_key, kis_api.app_secret,
+    ).authenticate_read_only(cache_path=cache_path, refresh_token=refresh_token)
+    account_client = KisAccountClient(
+        environment, kis_api.app_key, kis_api.app_secret, auth_result.access_token,
+        account_no, account_product_code,
+    )
+    order_status_client = KisOrderStatusClient(
+        environment, kis_api.app_key, kis_api.app_secret, auth_result.access_token,
+        account_no, account_product_code,
+    )
+    buying_power_client = KisBuyingPowerClient(
+        environment, kis_api.app_key, kis_api.app_secret, auth_result.access_token,
+        account_no, account_product_code,
+    )
+    order_client = KisOrderClient(
+        environment, kis_api.app_key, kis_api.app_secret, auth_result.access_token,
+        account_no, account_product_code,
+    )
+    with connect_database(db_path) as database:
+        database.init_schema()
+        cycle_time = kst_now()
+        reconciliation = reconcile_broker_state(
+            database, order_status_client, account_client, current_time=cycle_time,
+        )
+        order_management = manage_stale_orders(
+            database,
+            order_status_client,
+            current_time=cycle_time,
+            config=OrderManagementConfig(
+                buy_ttl_seconds=_env_number(
+                    "BUY_ORDER_TTL_SECONDS", 60, minimum=0,
+                ),
+                sell_ttl_seconds=_env_number(
+                    "SELL_ORDER_TTL_SECONDS", 30, minimum=0,
+                ),
+            ),
+        )
+        account = account_client.get_snapshot()
+        buying_power: KisBuyingPowerSnapshot | None = None
+        prices: list[tuple[str, float]] = []
+        for symbol in dict.fromkeys([*symbols, *(position.symbol for position in account.positions)]):
+            tick = database.latest_tick(symbol)
+            bar = database.latest_bar(symbol)
+            position = next((item for item in account.positions if item.symbol == symbol), None)
+            price = tick.price if tick is not None else bar.close if bar is not None else None
+            price = price if price is not None else (position.current_price if position else None)
+            if price is not None and price > 0:
+                prices.append((symbol, float(price)))
+        if not prices and symbols:
+            try:
+                quote = KisRestClient(
+                    environment, kis_api.app_key, kis_api.app_secret, auth_result.access_token,
+                ).get_current_price(symbols[0])
+                prices.append((quote.symbol, float(quote.price)))
+            except Exception:
+                pass
+        buying_power_error = False
+        if prices:
+            try:
+                buying_power = buying_power_client.get_snapshot(*prices[0])
+            except Exception:
+                buying_power_error = True
+        else:
+            buying_power_error = True
+
+        realized: KisRealizedPnlSnapshot | None = None
+        realized_error = False
+        if environment is KisEnvironment.REAL:
+            try:
+                realized = KisRealizedPnlClient(
+                    environment, kis_api.app_key, kis_api.app_secret,
+                    auth_result.access_token, account_no, account_product_code,
+                ).get_snapshot()
+            except Exception:
+                # A real-account P/L failure is deliberately an entry block.
+                realized_error = True
+
+        portfolio = build_portfolio_risk_snapshot(
+            account, database, now=kst_now(),
+            buying_power=buying_power, realized_pnl=realized,
+        )
+        unknown = set(portfolio.unknown_fields)
+        if buying_power_error or buying_power is None:
+            unknown.add("buying_power")
+        elif buying_power.orderable_cash is None or buying_power.orderable_quantity is None:
+            unknown.add("buying_power_fields")
+        if environment is KisEnvironment.REAL and realized_error:
+            unknown.add("realized_pnl")
+        if reconciliation.block_new_entries:
+            unknown.add("broker_reconciliation")
+        if order_management.entries_blocked:
+            unknown.add("order_management")
+        if unknown != set(portfolio.unknown_fields):
+            portfolio = replace(portfolio, unknown_fields=frozenset(unknown))
+        database.set_runtime_metadata(
+            LIVE_REPORT_KEY,
+            _sanitized_live_report(environment, account, portfolio, reconciliation, kst_now()),
+            updated_at=kst_now(),
+        )
+    return _BrokerCycleState(
+        order_client=order_client,
+        account_client=account_client,
+        buying_power_client=buying_power_client,
+        account=account,
+        portfolio=portfolio,
+        reconciliation=reconciliation,
+        order_management=order_management,
+        realized_pnl=realized,
+    )
+
+
+def _entry_budget_checker(client: KisBuyingPowerClient):
+    def check(symbol: str, price: float, quantity: int) -> bool:
+        snapshot = client.get_snapshot(symbol, price)
+        if snapshot.orderable_cash is None or snapshot.orderable_quantity is None:
+            return False
+        return (
+            snapshot.orderable_quantity >= quantity
+            and snapshot.orderable_cash >= price * quantity
+        )
+    return check
 
 
 def submit_live_shadow_order(
@@ -715,6 +1199,11 @@ def auto_trade_cycle(
     confirm: str,
     notify_telegram: bool,
     refresh_token: bool = False,
+    shared_ai_client=None,
+    service_owner_id: str | None = None,
+    portfolio: PortfolioRiskSnapshot | None = None,
+    buying_power_client: KisBuyingPowerClient | None = None,
+    runtime_control_override=None,
 ) -> int:
     if confirm != "AUTO_TRADE":
         print("auto-trade-cycle: BLOCKED")
@@ -728,14 +1217,31 @@ def auto_trade_cycle(
         open_position_symbols = [
             str(position["symbol"]) for position in database.list_open_live_positions()
         ]
-        control = database.get_runtime_control()
+        control = runtime_control_override or database.get_runtime_control()
+        requested_environment = KisEnvironment.parse(environment).value
+        if control.environment != requested_environment:
+            print("auto-trade-cycle: BLOCKED")
+            print(
+                "reason=runtime_environment_mismatch "
+                f"runtime={control.environment} requested={requested_environment} "
+                "broker_orders=none ai_calls=none"
+            )
+            return 3
     if not symbols and not open_position_symbols:
         raise ValueError("no symbols supplied and watchlist is empty")
+    if _lease_is_active(db_path, owner_id=service_owner_id):
+        print("auto-trade-cycle: BLOCKED")
+        print("reason=trading_service_lease_active broker_orders=none ai_calls=none")
+        return 3
     if control.paused:
         print("auto-trade-cycle: BLOCKED")
         print("reason=runtime_paused broker_orders=none ai_calls=none")
         return 3
     now = kst_now()
+    if not exchange_calendar_available():
+        print("auto-trade-cycle: BLOCKED")
+        print("reason=exchange_calendar_unavailable broker_orders=none ai_calls=none")
+        return 3
     if not is_regular_market_open(now):
         print("auto-trade-cycle: BLOCKED")
         print("reason=market_closed broker_orders=none ai_calls=none")
@@ -750,15 +1256,72 @@ def auto_trade_cycle(
         kis_account.account_no,
         kis_account.account_product_code,
     )
+    if portfolio is None or buying_power_client is None:
+        state = _make_broker_cycle_state(
+            config_path, env, db_path, list(dict.fromkeys([*symbols, *open_position_symbols])),
+            refresh_token,
+        )
+        if state.portfolio.fail_closed:
+            print("auto-trade-cycle: BLOCKED")
+            print(
+                "reason=broker_risk_snapshot_unavailable "
+                f"unknown={','.join(sorted(state.portfolio.unknown_fields)) or 'none'} "
+                "broker_orders=none ai_calls=none"
+            )
+            return 3
+        portfolio = state.portfolio
+        buying_power_client = state.buying_power_client
     project_root = Path(config_path).resolve().parent.parent
     cache_path = project_root / "data" / "auth" / f"kis_token_{env.value}.json"
     auth = KisAuthClient(env, kis_api.app_key, kis_api.app_secret)
     auth_result = auth.authenticate_read_only(cache_path=cache_path, refresh_token=refresh_token)
     if collect_seconds:
-        for symbol in symbols:
-            asyncio.run(collect_realtime_prices(
-                websocket_url(env), auth_result.approval_key, symbol, db_path, collect_seconds,
-            ))
+        collect_symbols = list(dict.fromkeys([*symbols, *open_position_symbols]))
+        with connect_database(db_path) as database:
+            database.init_schema()
+            collector = StreamingCollector(
+                endpoint=websocket_url(env),
+                approval_key=auth_result.approval_key,
+                symbols=collect_symbols,
+                database=database,
+            )
+            asyncio.run(collector.run(deadline=time.monotonic() + collect_seconds))
+    # Telegram controls may change while the stream is collecting. Re-read the
+    # gate on a separate connection immediately before creating/submitting orders.
+    with connect_database(db_path) as database:
+        database.init_schema()
+        latest_control = database.get_runtime_control()
+        emergency_value = (
+            database.get_runtime_metadata("emergency_stop")
+            or database.get_runtime_metadata("telegram.emergency_stop")
+            or ""
+        )
+    emergency_active = emergency_value.strip().lower() in {"1", "true", "yes", "on"}
+    gate_reasons = []
+    if latest_control.paused:
+        gate_reasons.append("runtime_paused")
+    if latest_control.environment != env.value:
+        gate_reasons.append("runtime_environment_mismatch")
+    if emergency_active:
+        gate_reasons.append("emergency_stop")
+    if gate_reasons:
+        print("auto-trade-cycle: BLOCKED")
+        print(
+            f"reason=post_collection_gate:{','.join(gate_reasons)} "
+            "broker_orders=none ai_calls=none"
+        )
+        return 3
+    if runtime_control_override is not None and runtime_control_override.paused:
+        control = replace(
+            latest_control,
+            paused=True,
+            reason=runtime_control_override.reason,
+            source=runtime_control_override.source,
+        )
+    else:
+        control = latest_control
+    # Collection can outlive the preflight time used for market-open checks.
+    cycle_time = kst_now()
     order_client = KisOrderClient(
         env,
         kis_api.app_key,
@@ -767,7 +1330,16 @@ def auto_trade_cycle(
         account_no,
         account_product_code,
     )
-    ai_client = RuleBasedAIClient() if ai == "rule" else OpenAITradingDecisionClient(env_value("OPENAI_API_KEY"))
+    ai_client = shared_ai_client
+    if ai_client is None:
+        if ai == "rule":
+            ai_client = RuleBasedAIClient()
+        else:
+            ai_client = OpenAITradingDecisionClient(
+                env_value("OPENAI_API_KEY"),
+                model=optional_env_value("OPENAI_MODEL") or "gpt-4o-mini",
+                budget=_usage_budget_from_env(),
+            )
     notifier = None
     if notify_telegram:
         notifier = _TelegramNotifier(env_value("TELEGRAM_BOT_TOKEN"), env_value("TELEGRAM_ALLOWED_CHAT_ID"))
@@ -778,11 +1350,15 @@ def auto_trade_cycle(
             database=database,
             ai_client=ai_client,
             submitter=order_client,
-            runtime_control=database.get_runtime_control(),
-            config=AutoTradeConfig(max_quantity=max_quantity),
+            runtime_control=control,
+            config=_auto_trade_config_from_env(max_quantity),
             confirm_auto_trade=True,
             notifier=notifier,
-            current_time=now,
+            current_time=cycle_time,
+            portfolio=None if portfolio is None else portfolio.portfolio,
+            entry_budget_checker=(
+                None if buying_power_client is None else _entry_budget_checker(buying_power_client)
+            ),
         )
     print("auto-trade-cycle: OK" if report.submitted_count else "auto-trade-cycle: NO_ORDERS")
     for result in report.results:
@@ -1143,11 +1719,10 @@ def build_parser() -> argparse.ArgumentParser:
     service.add_argument("--db", default="data/kis_ai_scalper.sqlite3")
     service.add_argument("--ai", choices=["rule", "openai"], default=os.getenv("AUTO_TRADE_AI", "openai"))
     service.add_argument("--max-quantity", type=int, default=int(os.getenv("AUTO_TRADE_MAX_QUANTITY", "1")))
-    service.add_argument("--collect-seconds", type=int, default=int(os.getenv("AUTO_TRADE_COLLECT_SECONDS", "10")))
+    service.add_argument("--collect-seconds", type=int, default=int(os.getenv("AUTO_TRADE_COLLECT_SECONDS", "50")))
     service.add_argument("--cycle-interval-seconds", type=int, default=int(os.getenv("AUTO_TRADE_CYCLE_INTERVAL_SECONDS", "60")))
     service.add_argument("--telegram-limit", type=int, default=10)
     service.add_argument("--telegram-timeout-seconds", type=int, default=5)
-    service.add_argument("--pause-on-start", action=argparse.BooleanOptionalAction, default=True)
     service.add_argument("--refresh-token", action="store_true", help="ignore the local token cache")
     return parser
 
@@ -1235,7 +1810,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.max_quantity, args.collect_seconds,
                 args.cycle_interval_seconds,
                 args.telegram_limit, args.telegram_timeout_seconds,
-                args.pause_on_start, args.refresh_token,
+                True, args.refresh_token,
             )
     except Exception as exc:
         if args.command in {

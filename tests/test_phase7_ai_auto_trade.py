@@ -23,7 +23,7 @@ OPEN_MARKET_TIME = datetime(2026, 8, 18, 9, 30)
 
 
 def seed_bars(database, symbol="005930", *, close=100_000):
-    start = datetime(2026, 8, 18, 9, 0)
+    start = datetime(2026, 8, 18, 9, 9)
     for index in range(21):
         price = close - (20 - index) * 200
         database.save_bar(MinuteBar(
@@ -118,7 +118,7 @@ def test_ai_buy_decision_requires_valid_price_ladder():
         )
 
 
-def test_normal_ai_buy_submits_and_opens_local_position(tmp_path):
+def test_normal_ai_buy_ack_does_not_open_local_position(tmp_path):
     decision = TradingAIDecision(
         symbol="005930",
         action=AIDecisionAction.BUY,
@@ -147,13 +147,17 @@ def test_normal_ai_buy_submits_and_opens_local_position(tmp_path):
         )
         positions = database.list_open_live_positions("005930")
         audits = database.list_broker_order_audits("005930")
+        order = database.connection.execute(
+            "SELECT * FROM broker_orders WHERE symbol=? AND side='BUY'", ("005930",)
+        ).fetchone()
 
     assert report.submitted_count == 1
     assert submitter.requests[0].side == KisOrderSide.BUY
     assert submitter.requests[0].quantity == 1
-    assert len(positions) == 1
+    assert positions == []
+    assert order["status"] == "ACKNOWLEDGED"
     assert audits[0]["side"] == "BUY"
-    assert notifier.messages and "BUY submitted" in notifier.messages[0]
+    assert notifier.messages and "BUY acknowledged" in notifier.messages[0]
 
 
 def test_high_risk_ai_buy_requests_approval_without_order(tmp_path):
@@ -208,7 +212,8 @@ def test_stop_loss_and_take_profit_sell_are_automatic(tmp_path):
             opened_at=opened_at,
             entry_broker_order_id="entry-1",
         )
-        database.save_tick(MarketTick("005930", opened_at + timedelta(minutes=1), 98_900, 1))
+        seed_bars(database)
+        database.save_tick(MarketTick("005930", OPEN_MARKET_TIME, 98_900, 1))
         report = run_auto_trade_cycle(
             ["005930"],
             database=database,
@@ -222,12 +227,26 @@ def test_stop_loss_and_take_profit_sell_are_automatic(tmp_path):
             current_time=OPEN_MARKET_TIME,
         )
         positions = database.list_open_live_positions("005930")
+        order = database.connection.execute(
+            "SELECT * FROM broker_orders WHERE symbol=? AND side='SELL'", ("005930",)
+        ).fetchone()
+        client_order_id = str(order["client_order_id"])
+        assert database.apply_broker_fill(
+            fill_id="sell-fill-1", client_order_id=client_order_id, quantity=2,
+            price=99_000, filled_at=OPEN_MARKET_TIME, broker_order_id="broker-1",
+        ) is True
+        assert database.materialize_order_fills(
+            client_order_id, close_reason="stop_loss"
+        ) == 1
+        closed_positions = database.list_open_live_positions("005930")
 
     assert report.results[0].action == "SELL"
     assert report.results[0].reason == "stop_loss"
     assert submitter.requests[0].side == KisOrderSide.SELL
     assert submitter.requests[0].quantity == 2
-    assert positions == []
+    assert order["status"] == "ACKNOWLEDGED"
+    assert len(positions) == 1
+    assert closed_positions == []
 
 
 def test_auto_trade_confirmation_required_blocks_before_ai_call(tmp_path):
@@ -290,6 +309,7 @@ def test_previous_day_live_position_is_sold_before_new_entries(tmp_path):
             opened_at=opened_at,
             entry_broker_order_id="entry-1",
         )
+        seed_bars(database)
         database.save_tick(MarketTick("005930", OPEN_MARKET_TIME, 100_500, 1))
         report = run_auto_trade_cycle(
             [],
@@ -307,6 +327,7 @@ def test_previous_day_live_position_is_sold_before_new_entries(tmp_path):
     assert report.results[0].action == "SELL"
     assert report.results[0].reason == "stale_previous_day_position"
     assert submitter.requests[0].side == KisOrderSide.SELL
+    assert len(database.list_open_live_positions("005930")) == 1
 
 
 def test_openai_client_uses_injected_session_and_structured_schema():
