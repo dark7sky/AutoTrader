@@ -15,11 +15,12 @@ from kis_ai_scalper.storage import connect_database
 UTC = timezone.utc
 
 
-def test_service_parser_removes_pause_bypass_and_defaults_collection_to_50(monkeypatch):
+def test_service_parser_removes_pause_bypass_and_defaults_collection_to_10(monkeypatch):
     monkeypatch.delenv("AUTO_TRADE_COLLECT_SECONDS", raising=False)
     args = cli.build_parser().parse_args(["service-loop"])
 
-    assert args.collect_seconds == 50
+    assert args.collect_seconds == 10
+    assert args.cycle_interval_seconds == 20
     assert not hasattr(args, "pause_on_start")
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["service-loop", "--no-pause-on-start"])

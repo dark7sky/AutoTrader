@@ -121,7 +121,8 @@ def test_same_completed_bar_submits_once_when_ai_decision_id_changes(tmp_path):
     assert second.results[0].reason == "order_already_claimed"
     assert len(submitter.requests) == 1
     assert len(orders) == 1
-    assert [row["decision_id"] for row in decisions] == ["decision-1", "decision-2"]
+    # Duplicate completed bars are rejected before another paid AI call.
+    assert [row["decision_id"] for row in decisions] == ["decision-1"]
 
 
 def test_confirmed_cancel_blocks_same_bar_but_allows_only_new_bar(tmp_path):

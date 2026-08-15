@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 from typing import Any, Callable, Protocol
 
 from kis_ai_scalper.ai.decision import (
@@ -26,6 +27,7 @@ from kis_ai_scalper.broker.kis_market_rules import (
     normalize_krx_limit_price,
     validate_risk_reward,
 )
+from kis_ai_scalper.execution.exit_policy import ExitPolicy, ExitPolicyError, ExitQuote
 from kis_ai_scalper.risk import OrderIntent, PortfolioState, RiskConfig, evaluate_order_intent
 from kis_ai_scalper.storage.database import Database, RuntimeControl
 from kis_ai_scalper.strategies.candidate import scan_candidates
@@ -51,6 +53,9 @@ class AutoTradeConfig:
     enforce_market_hours: bool = True
     max_tick_age_seconds: int = 10
     max_bar_age_seconds: int = 90
+    cycle_deadline_seconds: float | None = 30.0
+    max_ai_response_age_seconds: float | None = None
+    max_exit_requotes: int = 3
 
 
 @dataclass(frozen=True)
@@ -86,18 +91,47 @@ def run_auto_trade_cycle(
     current_time: datetime | None = None,
     portfolio: PortfolioState | None = None,
     entry_budget_checker: Callable[[str, float, int], bool] | None = None,
+    clock: Callable[[], datetime] | None = None,
+    post_ai_price_checker: Callable[[str], float] | None = None,
+    exit_price_checker: Callable[[str], float] | None = None,
 ) -> AutoTradeCycleReport:
     config = config or AutoTradeConfig()
     if config.max_quantity <= 0:
         raise ValueError("max_quantity must be positive")
-    now = current_time or kst_now()
     if config.max_tick_age_seconds <= 0 or config.max_bar_age_seconds <= 0:
         raise ValueError("freshness limits must be positive")
+    if config.cycle_deadline_seconds is not None and config.cycle_deadline_seconds <= 0:
+        raise ValueError("cycle_deadline_seconds must be positive")
+    if config.max_ai_response_age_seconds is not None and config.max_ai_response_age_seconds <= 0:
+        raise ValueError("max_ai_response_age_seconds must be positive")
+    if config.max_entry_deviation_pct < 0:
+        raise ValueError("max_entry_deviation_pct must not be negative")
+    if config.max_exit_requotes < 0:
+        raise ValueError("max_exit_requotes must not be negative")
+
+    if clock is None:
+        # ``current_time`` is a long-standing replay/test hook. Preserve its
+        # fixed-time behavior unless the caller opts into the per-read clock.
+        now_provider: Callable[[], datetime] = (
+            (lambda: current_time) if current_time is not None else kst_now
+        )
+    else:
+        now_provider = clock
+    cycle_started_at = as_kst(current_time) if current_time is not None else _clock_now(now_provider)
+    cycle_deadline = (
+        None
+        if config.cycle_deadline_seconds is None
+        else cycle_started_at + timedelta(seconds=config.cycle_deadline_seconds)
+    )
     results: list[AutoTradeSymbolResult] = []
     open_position_symbols = [str(position["symbol"]) for position in database.list_open_live_positions()]
     symbols_to_process = list(dict.fromkeys([*symbols, *open_position_symbols]))
     for symbol in symbols_to_process:
         try:
+            now = _clock_now(now_provider)
+            if _deadline_reached(now, cycle_deadline):
+                results.append(_blocked(symbol, "cycle_deadline_exceeded"))
+                continue
             if config.enforce_market_hours and not is_regular_market_open(now):
                 results.append(_blocked(symbol, "market_closed"))
                 continue
@@ -108,7 +142,11 @@ def run_auto_trade_cycle(
             if freshness_reason is not None:
                 results.append(_blocked(symbol, freshness_reason))
                 continue
-            exit_result = _maybe_exit_position(symbol, database, submitter, now, notifier)
+            exit_result = _maybe_exit_position(
+                symbol, database, submitter, now, notifier,
+                config=config,
+                exit_price_checker=exit_price_checker,
+            )
             if exit_result is not None:
                 results.append(exit_result)
                 continue
@@ -124,10 +162,14 @@ def run_auto_trade_cycle(
             if not is_new_entry_window(now):
                 results.append(_blocked(symbol, "new_entry_window_closed"))
                 continue
+            if _deadline_reached(_clock_now(now_provider), cycle_deadline):
+                results.append(_blocked(symbol, "cycle_deadline_exceeded"))
+                continue
             results.append(
                 _maybe_enter_position(
                     symbol, database, ai_client, submitter, config, now, notifier, portfolio,
-                    entry_budget_checker,
+                    entry_budget_checker, clock=now_provider, cycle_deadline=cycle_deadline,
+                    post_ai_price_checker=post_ai_price_checker,
                 )
             )
         except Exception as exc:
@@ -142,6 +184,9 @@ def _maybe_exit_position(
     submitter: OrderSubmitter,
     now: datetime,
     notifier: Notifier | None,
+    *,
+    config: AutoTradeConfig,
+    exit_price_checker: Callable[[str], float] | None,
 ) -> AutoTradeSymbolResult | None:
     positions = database.list_open_live_positions(symbol)
     if not positions:
@@ -169,7 +214,24 @@ def _maybe_exit_position(
         return _blocked(symbol, "position_hold")
     if _has_unresolved_order(database, symbol, "SELL"):
         return _blocked(symbol, "exit_order_pending")
-    normalized_price = normalize_krx_limit_price(current_price, "sell")
+    if _exit_attempt_count(database, position) > config.max_exit_requotes:
+        database.set_runtime_metadata("operator_review", "true", updated_at=now)
+        database.set_runtime_metadata("block_new_entries", "true", updated_at=now)
+        _notify(notifier, f"SELL requires operator review {symbol}: max requotes reached")
+        return _blocked(symbol, "max_exit_requotes_reached")
+    if exit_price_checker is not None:
+        try:
+            current_price = float(exit_price_checker(symbol))
+        except Exception:
+            return _blocked(symbol, "exit_price_check_failed")
+        if not math.isfinite(current_price) or current_price <= 0:
+            return _blocked(symbol, "exit_price_invalid")
+    try:
+        normalized_price = ExitPolicy().plan_sell_limit(
+            ExitQuote(bid=current_price, ask=None, current_price=current_price)
+        ).price
+    except ExitPolicyError:
+        return _blocked(symbol, "exit_price_policy_blocked")
     request = KisOrderRequest(
         symbol=symbol,
         side=KisOrderSide.SELL,
@@ -181,7 +243,7 @@ def _maybe_exit_position(
         submitter=submitter,
         request=request,
         signal_id=str(position["signal_id"]),
-        idempotency_key=_exit_signal_id(position, reason, database),
+        idempotency_key=_exit_signal_id(position, reason, now),
         reason=reason,
         created_at=now,
     )
@@ -203,6 +265,10 @@ def _maybe_enter_position(
     notifier: Notifier | None,
     portfolio: PortfolioState | None,
     entry_budget_checker: Callable[[str, float, int], bool] | None,
+    *,
+    clock: Callable[[], datetime],
+    cycle_deadline: datetime | None,
+    post_ai_price_checker: Callable[[str], float] | None,
 ) -> AutoTradeSymbolResult:
     bars = database.load_bars(symbol, limit=120)
     snapshot = build_feature_snapshot(bars)
@@ -218,35 +284,74 @@ def _maybe_enter_position(
         if approval is not None and str(approval["status"]) == "PENDING":
             return _blocked(symbol, "operator_approval_required")
         if approval is not None and str(approval["status"]) == "APPROVED":
+            if _deadline_reached(_clock_now(clock), cycle_deadline):
+                return _blocked(symbol, "cycle_deadline_exceeded")
             return _execute_approved_entry(
                 symbol, signal_id, approval, snapshot, database, submitter, config, now,
-                notifier, portfolio, entry_budget_checker,
+                notifier, portfolio, entry_budget_checker, post_ai_price_checker,
             )
         if approval is not None:
             return _blocked(symbol, f"approval_{str(approval['status']).lower()}")
 
+    if database.get_broker_order(f"ai:buy:{signal_id}") is not None:
+        return _blocked(symbol, "order_already_claimed")
+
     candidates = scan_candidates(snapshot)
-    decision = ai_client.decide(context_from_snapshot(snapshot, candidates))
-    _record_decision(database, decision, now)
+    if not candidates and _is_network_decision_client(ai_client):
+        return _blocked(symbol, "no_deterministic_candidate")
+    pre_ai_now = _clock_now(clock)
+    if _deadline_reached(pre_ai_now, cycle_deadline):
+        return _blocked(symbol, "cycle_deadline_exceeded")
+    pre_ai_freshness = _freshness_reason(database, symbol, pre_ai_now, config)
+    if pre_ai_freshness is not None:
+        return _blocked(symbol, pre_ai_freshness)
+    pre_ai_tick = database.latest_tick(symbol)
+    if pre_ai_tick is None:
+        return _blocked(symbol, "stale_tick")
+    decision = ai_client.decide(
+        context_from_snapshot(snapshot, [candidate.__dict__ for candidate in candidates])
+    )
+    response_now = _clock_now(clock)
+    _record_decision(database, decision, response_now)
+    if _deadline_reached(response_now, cycle_deadline):
+        return _blocked(symbol, "cycle_deadline_exceeded")
+    response_guard_reason = _ai_response_guard_reason(
+        database, symbol, pre_ai_tick, response_now, decision, config,
+    )
+    if response_guard_reason is not None:
+        return _blocked(symbol, response_guard_reason)
     if decision.symbol != symbol:
         return _blocked(symbol, "ai_symbol_mismatch")
     if decision.action is not AIDecisionAction.BUY:
         return _blocked(symbol, f"ai_{decision.action.value.lower()}")
+    assert decision.entry_price is not None
+    assert decision.stop_loss_price is not None
+    assert decision.take_profit_price is not None
+    entry_price = normalize_krx_limit_price(decision.entry_price, "buy")
+    post_ai_price_reason = _post_ai_live_price_guard_reason(
+        post_ai_price_checker,
+        symbol=symbol,
+        market_snapshot_price=snapshot.latest_close,
+        entry_price=entry_price,
+        max_deviation_pct=config.max_entry_deviation_pct,
+    )
+    if post_ai_price_reason is not None:
+        return _blocked(symbol, post_ai_price_reason)
+    try:
+        snapshot_deviation = abs(entry_price - float(snapshot.latest_close)) / float(snapshot.latest_close) * 100
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return _blocked(symbol, "market_snapshot_invalid")
+    if not math.isfinite(snapshot_deviation) or snapshot_deviation > config.max_entry_deviation_pct:
+        return _blocked(symbol, "entry_deviation_too_large")
     if decision.confidence < config.min_confidence:
         return _blocked(symbol, "confidence_below_minimum")
     if decision.high_risk:
-        assert decision.entry_price is not None
-        assert decision.stop_loss_price is not None
-        assert decision.take_profit_price is not None
-        entry_price = normalize_krx_limit_price(decision.entry_price, "buy")
         stop_loss_price = normalize_krx_limit_price(decision.stop_loss_price, "buy")
         take_profit_price = normalize_krx_limit_price(decision.take_profit_price, "sell")
         try:
             validate_risk_reward(entry_price, take_profit_price, stop_loss_price)
         except ValueError:
             return _blocked(symbol, "invalid_risk_reward")
-        if abs(entry_price - snapshot.latest_close) / snapshot.latest_close * 100 > config.max_entry_deviation_pct:
-            return _blocked(symbol, "entry_deviation_too_large")
         quantity = _risk_quantity(
             database, config, portfolio, symbol, signal_id, decision.confidence, entry_price,
             stop_loss_price,
@@ -275,19 +380,12 @@ def _maybe_enter_position(
                 f"risk={decision.risk_level.value}",
             )
         return _blocked(symbol, "operator_approval_required")
-    assert decision.entry_price is not None
-    assert decision.stop_loss_price is not None
-    assert decision.take_profit_price is not None
-    entry_price = normalize_krx_limit_price(decision.entry_price, "buy")
     stop_loss_price = normalize_krx_limit_price(decision.stop_loss_price, "buy")
     take_profit_price = normalize_krx_limit_price(decision.take_profit_price, "sell")
     try:
         validate_risk_reward(entry_price, take_profit_price, stop_loss_price)
     except ValueError:
         return _blocked(symbol, "invalid_risk_reward")
-    deviation = abs(entry_price - snapshot.latest_close) / snapshot.latest_close * 100
-    if deviation > config.max_entry_deviation_pct:
-        return _blocked(symbol, "entry_deviation_too_large")
     risk_decision = evaluate_order_intent(
         config.risk,
         portfolio if portfolio is not None else PortfolioState(open_positions=database.paper_positions()),
@@ -307,6 +405,8 @@ def _maybe_enter_position(
         return _blocked(symbol, "quantity_zero")
     if not _entry_budget_ok(entry_budget_checker, symbol, entry_price, quantity):
         return _blocked(symbol, "entry_budget_unavailable_or_insufficient")
+    if _deadline_reached(_clock_now(clock), cycle_deadline):
+        return _blocked(symbol, "cycle_deadline_exceeded")
     request = KisOrderRequest(symbol=symbol, side=KisOrderSide.BUY, quantity=quantity, price=entry_price)
     result = _submit_with_ledger(
         database=database,
@@ -375,6 +475,49 @@ def _entry_budget_ok(
         return False
 
 
+def _post_ai_live_price_guard_reason(
+    checker: Callable[[str], float] | None,
+    *,
+    symbol: str,
+    market_snapshot_price: Any,
+    entry_price: Any,
+    max_deviation_pct: float,
+) -> str | None:
+    if checker is None:
+        return None
+    try:
+        fresh_price = checker(symbol)
+    except Exception:
+        return "post_ai_price_check_failed"
+    if isinstance(fresh_price, bool):
+        return "post_ai_price_invalid"
+    try:
+        fresh_price = float(fresh_price)
+    except (TypeError, ValueError, OverflowError):
+        return "post_ai_price_invalid"
+    if not math.isfinite(fresh_price) or fresh_price <= 0:
+        return "post_ai_price_invalid"
+    try:
+        snapshot_price = float(market_snapshot_price)
+        proposed_entry = float(entry_price)
+    except (TypeError, ValueError, OverflowError):
+        return "market_snapshot_invalid"
+    if (
+        not math.isfinite(snapshot_price)
+        or snapshot_price <= 0
+        or not math.isfinite(proposed_entry)
+        or proposed_entry <= 0
+    ):
+        return "market_snapshot_invalid"
+    snapshot_deviation = abs(fresh_price - snapshot_price) / snapshot_price * 100
+    if snapshot_deviation > max_deviation_pct:
+        return "post_ai_price_deviation_too_large"
+    entry_deviation = abs(proposed_entry - fresh_price) / fresh_price * 100
+    if entry_deviation > max_deviation_pct:
+        return "entry_deviation_from_live_too_large"
+    return None
+
+
 def _execute_approved_entry(
     symbol: str,
     signal_id: str,
@@ -387,6 +530,7 @@ def _execute_approved_entry(
     notifier: Notifier | None,
     portfolio: PortfolioState | None,
     entry_budget_checker: Callable[[str, float, int], bool] | None,
+    post_ai_price_checker: Callable[[str], float] | None,
 ) -> AutoTradeSymbolResult:
     request_id = str(approval["request_id"])
     if str(approval["symbol"]) != symbol or str(approval["signal_id"] or "") != signal_id:
@@ -417,6 +561,16 @@ def _execute_approved_entry(
     ):
         database.finish_approval_request(request_id, success=False, now=now)
         return _blocked(symbol, "approval_terms_changed")
+    live_price_reason = _post_ai_live_price_guard_reason(
+        post_ai_price_checker,
+        symbol=symbol,
+        market_snapshot_price=snapshot.latest_close,
+        entry_price=entry_price,
+        max_deviation_pct=config.max_entry_deviation_pct,
+    )
+    if live_price_reason is not None:
+        database.finish_approval_request(request_id, success=False, now=now)
+        return _blocked(symbol, live_price_reason)
     try:
         validate_risk_reward(entry_price, take_profit_price, stop_loss_price)
     except ValueError:
@@ -554,18 +708,68 @@ def _freshness_reason(
     return None
 
 
+def _clock_now(clock: Callable[[], datetime]) -> datetime:
+    return as_kst(clock())
+
+
+def _is_network_decision_client(client: TradingAIClient) -> bool:
+    return type(client).__name__ == "Open" + "AI" + "TradingDecisionClient"
+
+
+def _deadline_reached(now: datetime, deadline: datetime | None) -> bool:
+    return deadline is not None and as_kst(now) >= as_kst(deadline)
+
+
+def _ai_response_guard_reason(
+    database: Database,
+    symbol: str,
+    pre_ai_tick: Any,
+    response_now: datetime,
+    decision: TradingAIDecision,
+    config: AutoTradeConfig,
+) -> str | None:
+    freshness_reason = _freshness_reason(database, symbol, response_now, config)
+    if freshness_reason is not None:
+        return f"{freshness_reason}_after_ai"
+    post_ai_tick = database.latest_tick(symbol)
+    if post_ai_tick is None:
+        return "stale_tick_after_ai"
+    if pre_ai_tick.price <= 0:
+        return "price_snapshot_invalid"
+    price_drift = abs(post_ai_tick.price - pre_ai_tick.price) / pre_ai_tick.price * 100
+    if price_drift > config.max_entry_deviation_pct:
+        return "price_moved_during_ai"
+
+    response_age = (
+        as_kst(response_now) - as_kst(decision.generated_at)
+    ).total_seconds()
+    if response_age < 0:
+        return "ai_response_from_future"
+    if (
+        config.max_ai_response_age_seconds is not None
+        and response_age > config.max_ai_response_age_seconds
+    ):
+        return "ai_response_too_old"
+    return None
+
+
 def _entry_signal_id(symbol: str, bar_start: datetime) -> str:
     return f"entry:{symbol}:{as_kst(bar_start).isoformat(timespec='minutes')}"
 
 
-def _exit_signal_id(position: Any, reason: str, database: Database) -> str:
-    latest_bar = database.latest_bar(str(position["symbol"]))
-    marker = (
-        as_kst(latest_bar.start).isoformat(timespec="minutes")
-        if latest_bar is not None
-        else as_kst(datetime.fromisoformat(str(position["opened_at"]))).isoformat(timespec="minutes")
-    )
+def _exit_signal_id(position: Any, reason: str, now: datetime) -> str:
+    current = as_kst(now)
+    marker = current.replace(second=(current.second // 10) * 10, microsecond=0).isoformat()
     return f"exit:{position['position_id']}:{reason}:{marker}"
+
+
+def _exit_attempt_count(database: Database, position: Any) -> int:
+    row = database.connection.execute(
+        """SELECT COUNT(*) FROM broker_orders
+           WHERE side='SELL' AND signal_id=? AND symbol=?""",
+        (str(position["signal_id"]), str(position["symbol"])),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def _has_unresolved_order(database: Database, symbol: str, side: str) -> bool:

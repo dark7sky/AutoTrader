@@ -8,7 +8,7 @@
 
 - Docker의 기본 장기 실행 대상은 `trading-service` 단독 서비스입니다. `app`, smoke, collector, `telegram-poll`, `auto-trade-cycle`은 별도 도구 또는 프로파일입니다.
 - 서비스는 시작할 때마다 runtime `paused=true`를 기록합니다. 기존 DB가 running이었어도 자동으로 재개하지 않습니다.
-- `paused` 상태에서 환경을 확인하고 Telegram `/resume`으로만 자동매매를 시작합니다.
+- `paused` 상태에서도 preflight와 게이트가 유효하면 주문·체결 상태 supervisor가 계속 잔고와 주문을 대조합니다. 단, 신규 주문은 제출하지 않습니다. Telegram `/resume`으로만 자동매매를 시작합니다.
 - Telegram `/env demo`와 `/env real` 전환은 paused 상태에서만 가능합니다. real은 challenge 확인 절차가 추가됩니다.
 - 주문 전 KRX `XKRX` 거래소 캘린더를 확인합니다. 캘린더가 준비되지 않으면 broker preflight가 fail-closed로 동작합니다.
 - 브로커에만 있는 기존 잔고를 local 포지션으로 자동 채택하지 않습니다. local에만 있거나 수량이 다른 포지션도 자동 청산하지 않습니다.
@@ -23,6 +23,7 @@
 구현된 주요 경로:
 
 - KIS REST/WebSocket 인증과 국내주식 현재가·체결가 수집
+- KIS 실시간 체결통보 worker: 실전 `H0STCNI0`, 모의 `H0STCNI9`; `KIS_HTS_ID`는 HTS 사용자/로그인 ID이며 event-driven 체결 처리에 사실상 필수입니다. worker를 사용할 수 없을 때는 REST 주문 supervisor가 보완합니다.
 - SQLite 기반 tick, 1분봉, AI 판단, broker 주문·체결 ledger
 - KRX 캘린더 기반 장중 gate와 신규진입 시간 gate
 - deterministic risk engine, 잔고·local position 대조, 주문 상태 재조회
@@ -65,8 +66,14 @@ OPENAI_API_KEY=<OPENAI_API_KEY>
 OPENAI_MODEL=gpt-4o-mini
 AUTO_TRADE_AI=openai
 AUTO_TRADE_MAX_QUANTITY=1
-AUTO_TRADE_COLLECT_SECONDS=50
-AUTO_TRADE_CYCLE_INTERVAL_SECONDS=60
+AUTO_TRADE_COLLECT_SECONDS=10
+AUTO_TRADE_CYCLE_INTERVAL_SECONDS=20
+KIS_HTS_ID=<KIS_HTS_LOGIN_ID>
+ORDER_SUPERVISOR_INTERVAL_SECONDS=5
+OPENAI_TIMEOUT_SECONDS=8
+OPENAI_MAX_RETRIES=1
+OPENAI_MAX_RESPONSE_AGE_SECONDS=20
+AUTO_TRADE_DECISION_DEADLINE_SECONDS=25
 DATA_DIR=./data
 ```
 
@@ -86,7 +93,9 @@ LIVE_TRADING_ENABLED=true
 - `KIS_ENV=demo`는 smoke와 단발 CLI의 모의계좌 대상을 선택합니다. 장기 실행 `trading-service`의 현재 대상은 SQLite runtime environment이며 Telegram `/env`로 관리합니다. `KIS_REAL_*` 값은 모의 BUY/SELL 검증 전 입력하지 않는 것을 권장합니다.
 - `OPENAI_API_KEY`는 `AUTO_TRADE_AI=openai`일 때 필요합니다. `AUTO_TRADE_AI=rule`은 규칙 기반 dry-run용입니다.
 - `OPENAI_ADMIN_KEY` 또는 `OPENAI_USAGE_API_KEY`는 `/cost`와 비용 줄을 조회할 때만 선택적으로 사용합니다. 비용 키가 없다고 주문 판단 기능이 자동으로 중단되지는 않습니다.
-- `AUTO_TRADE_COLLECT_SECONDS=50`은 현재 Docker Compose 기본값이자 장기 서비스 권장 수집 시간입니다. 이전 배포본에서 10초를 명시했다면 Portainer Stack 환경변수를 `50`으로 갱신하세요.
+- `AUTO_TRADE_COLLECT_SECONDS=10`, `AUTO_TRADE_CYCLE_INTERVAL_SECONDS=20`은 서비스 기본값입니다. 계좌·risk snapshot은 수집이 끝난 뒤 새로 읽습니다.
+- `KIS_HTS_ID`는 KIS 앱 키·시크릿·계좌번호가 아니라 HTS 사용자/로그인 ID입니다. 실시간 체결통보 worker를 event-driven으로 사용하려면 입력해야 하며, 누락 시 REST 주문 supervisor가 5초 주기로 fallback합니다.
+- AI는 deterministic 후보가 있을 때만 호출하고, 같은 bar에서는 유료 호출을 중복하지 않습니다. 판단 deadline은 25초, API timeout은 8초, 일시적 오류 재시도는 1회이며 응답 뒤 KIS 현재가를 다시 검증합니다.
 - `BUY_ORDER_TTL_SECONDS=60`, `SELL_ORDER_TTL_SECONDS=30`은 미체결 취소 기준입니다.
 - `TELEGRAM_ALLOWED_CHAT_ID`가 없으면 Telegram 제어와 알림을 사용할 수 없습니다. 허용되지 않은 chat id의 명령은 처리하지 않습니다.
 
@@ -127,6 +136,12 @@ python -m kis_ai_scalper.cli watchlist-list --db data/kis_ai_scalper.sqlite3
 docker compose --profile trade run --rm auto-trade-cycle
 ```
 
+체결통보 구독 ACK만 주문 없이 확인하려면 다음 smoke를 사용합니다.
+
+```powershell
+docker compose --profile smoke run --rm smoke-fill-notice
+```
+
 ## Telegram 운영
 
 주요 명령:
@@ -150,8 +165,11 @@ docker compose --profile trade run --rm auto-trade-cycle
 /live-report      최근 broker snapshot
 /cost             OpenAI 비용 조회
 /emergency-stop   pause와 emergency stop 활성화
+/cancel-open-buys 알려진 미체결 BUY 취소 요청 후 terminal 확정 대기
 /clear-emergency  paused 상태에서 emergency stop 해제
 ```
+
+`/control`의 **Cancel open buys** 버튼도 같은 동작을 합니다. `/emergency-stop`과 `/cancel-open-buys`는 runtime을 paused로 만들고, local ledger에 알려진 open BUY에 대해서만 취소를 요청합니다. KIS가 terminal 상태를 확인할 때까지 주문은 `CANCEL_PENDING`이며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
 
 real 전환 순서:
 
@@ -166,11 +184,12 @@ real에서 pause하거나 emergency stop을 사용하면 다시 resume하기 전
 
 장중 cycle은 대략 다음 순서로 동작합니다.
 
-1. KIS 주문 상태와 계좌 snapshot을 읽습니다.
-2. local 주문에 대응하는 KIS 주문만 ledger에 반영합니다. broker-only 체결·잔고는 자동으로 local position으로 만들지 않습니다.
-3. local position과 broker position의 수량이 다르거나 한쪽에만 있으면 `operator_review=true`, `block_new_entries=true`를 기록합니다.
-4. 이 상태에서는 신규 BUY를 차단하고 Telegram에 원인을 보냅니다. runtime을 자동 pause로 바꾸지는 않지만, 운영자는 원인 확인 전 `/pause`를 유지해야 합니다.
-5. local position을 불일치 해소용으로 자동 청산하지 않습니다. 외부 수동 주문, 재시작 중 체결, 계좌·주문 조회 장애를 확인하고 ledger와 KIS 상태를 운영자가 대조합니다.
+1. 시세 수집을 완료합니다.
+2. 그 직후 KIS 주문 상태와 계좌 snapshot을 새로 읽습니다.
+3. local 주문에 대응하는 KIS 주문만 ledger에 반영합니다. broker-only 체결·잔고는 자동으로 local position으로 만들지 않습니다.
+4. local position과 broker position의 수량이 다르거나 한쪽에만 있으면 `operator_review=true`, `block_new_entries=true`를 기록합니다.
+5. 이 상태에서는 신규 BUY를 차단하고 Telegram에 원인을 보냅니다. runtime을 자동 pause로 바꾸지는 않지만, 운영자는 원인 확인 전 `/pause`를 유지해야 합니다.
+6. local position을 불일치 해소용으로 자동 청산하지 않습니다. 외부 수동 주문, 재시작 중 체결, 계좌·주문 조회 장애를 확인하고 ledger와 KIS 상태를 운영자가 대조합니다.
 
 미체결 주문 취소도 같은 원칙을 따릅니다. BUY 60초, SELL 30초가 지나면 취소 요청을 한 번 보내고, KIS가 `CANCELLED`, `FILLED`, `REJECTED` 중 하나를 보고할 때까지 신규진입을 다시 평가하지 않습니다. 취소 요청이 애매하거나 주문 식별자가 맞지 않으면 `UNKNOWN`으로 남기고 신규진입을 차단합니다.
 
@@ -185,13 +204,15 @@ real에서 pause하거나 emergency stop을 사용하면 다시 resume하기 전
 3. `docker compose up -d trading-service`로 시작합니다. 서비스가 paused로 시작하는지 로그와 `/status`로 확인합니다.
 4. KIS REST/WebSocket smoke와 watchlist를 확인합니다. KRX 휴장일이면 주문이 없는 것이 정상입니다.
 5. demo 주문을 검증할 시점에만 `CONFIG_LIVE_TRADING_ENABLED=true`, `LIVE_TRADING_ENABLED=true`를 설정하고 서비스를 재시작합니다. 재시작 후에도 서비스는 다시 paused로 시작합니다.
-6. `/control`, `/env demo`, `/positions`, `/orders`, `/fills`를 확인한 뒤 `/resume`합니다.
+6. `/control`, `/env demo`, `/positions`, `/orders`, `/fills`를 확인합니다. `/status`에서 체결통보 worker 또는 REST supervisor의 상태·heartbeat를 확인한 뒤 `/resume`합니다.
 
 월요일부터 금요일까지 장중:
 
 - 매일 시작 시 paused·environment·heartbeat·`operator_review`·`block_new_entries`를 확인합니다.
 - 후보, HOLD, risk reject는 주문 없음으로 기록합니다. 고위험 BUY는 `/approvals`에서 조건과 만료 시각을 확인하고 필요한 경우에만 승인합니다.
+- KIS 실시간 체결통보 worker의 접수·체결·부분 체결 heartbeat와 REST supervisor fallback을 확인합니다.
 - BUY 미체결 60초, SELL 미체결 30초 취소가 KIS 상태 재조회로 확정되는지 확인합니다.
+- 실제 demo 장중 BUY, 부분 체결, 취소, SELL을 각각 검증하기 전에는 real로 전환하지 않습니다.
 - broker-only, local-only, 수량 불일치가 발생하면 신규진입을 허용하지 않고 원인을 기록합니다. 자동 채택·자동 청산으로 덮어쓰지 않습니다.
 - 장 마감 후 `/report`, `/live-report`, `/orders`, `/fills`를 저장하고 data 백업을 갱신합니다.
 
@@ -199,7 +220,7 @@ real에서 pause하거나 emergency stop을 사용하면 다시 resume하기 전
 
 - 실제 KIS demo 접수·체결·취소·부분 체결 응답과 local ledger가 일치하는지 확인합니다.
 - Telegram pause/resume, approval 만료, 불일치 알림, service restart 후 pause 동작을 확인합니다.
-- 실패·미확인 항목이 있으면 real로 전환하지 않습니다. 이 저장소의 문서 상태는 계속 “코드 준비 완료, 장중 모의 검증 필요”로 둡니다.
+- 실패·미확인 항목이 있으면 real로 전환하지 않습니다. 실제 장중 demo BUY·부분 체결·취소·SELL 검증은 실전 전환의 잔여 필수 조건입니다.
 
 ## 데이터 영속화와 백업
 

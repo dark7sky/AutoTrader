@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import json
-import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +22,7 @@ REAL_CHALLENGE_EXPIRES_KEY = "telegram.real_challenge_expires"
 REAL_RESUME_ARM_EXPIRES_KEY = "telegram.real_resume_arm_expires"
 REAL_RESUME_ARM_USES_KEY = "telegram.real_resume_arm_uses"
 EMERGENCY_STOP_KEY = "telegram.emergency_stop"
+CANCEL_OPEN_BUYS_KEY = "operator.cancel_open_buys_requested"
 LIVE_REPORT_SNAPSHOT_KEY = "live_report_snapshot"
 HEARTBEAT_MAX_AGE_SECONDS = 180.0
 
@@ -93,6 +93,8 @@ KEYBOARD = {
     ], [
         {"text": "Emergency stop", "callback_data": "control:emergency-stop"},
         {"text": "Clear emergency", "callback_data": "control:clear-emergency"},
+    ], [
+        {"text": "Cancel open buys", "callback_data": "control:cancel-open-buys"},
     ]]
 }
 
@@ -111,6 +113,35 @@ def _set_metadata(db_path: str, key: str, value: str) -> None:
     with connect_database(db_path) as database:
         database.init_schema()
         database.set_runtime_metadata(key, value)
+
+
+def _request_open_buy_cancellation(db_path: str) -> bool:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        pending = database.connection.execute(
+            """SELECT 1 FROM broker_orders
+               WHERE side='BUY'
+                 AND status IN ('ACKNOWLEDGED','PARTIALLY_FILLED','CANCEL_PENDING','UNKNOWN')
+               LIMIT 1"""
+        ).fetchone() is not None
+        database.set_runtime_metadata(CANCEL_OPEN_BUYS_KEY, "true" if pending else "false")
+    return pending
+
+
+def _resume_safety_reason(db_path: str) -> str | None:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        if _safe_flag(database.get_runtime_metadata("operator_review")) == "true":
+            return "operator review is active"
+        if _safe_flag(database.get_runtime_metadata("block_new_entries")) == "true":
+            return "new entries are blocked"
+        row = database.connection.execute(
+            """SELECT status FROM broker_orders
+               WHERE status IN ('CANCEL_PENDING','UNKNOWN') LIMIT 1"""
+        ).fetchone()
+        if row is not None:
+            return f"broker order is unresolved ({row['status']})"
+    return None
 
 
 def _real_challenge(db_path: str) -> str:
@@ -177,11 +208,18 @@ def _status_text(db_path: str) -> str:
         live_positions = database.list_open_live_positions()
         paper_positions = database.paper_positions()
         heartbeat = database.get_heartbeat("trading-service")
+        fill_heartbeat = database.get_heartbeat("fill-notice")
+        supervisor_heartbeat = database.get_heartbeat("order-supervisor")
+        fill_status = database.get_runtime_metadata("fill-notice:status")
+        supervisor_status = database.get_runtime_metadata("order-supervisor.status")
         operator_review = database.get_runtime_metadata("operator_review")
         block_entries = database.get_runtime_metadata("block_new_entries")
         emergency = database.get_runtime_metadata(EMERGENCY_STOP_KEY) or database.get_runtime_metadata("emergency_stop")
+        cancel_open_buys = database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY)
     state = "paused" if control.paused else "running"
     heartbeat_text, heartbeat_healthy = _heartbeat_status(heartbeat)
+    fill_heartbeat_text, fill_healthy = _heartbeat_status(fill_heartbeat)
+    supervisor_heartbeat_text, supervisor_healthy = _heartbeat_status(supervisor_heartbeat)
     return (
         f"runtime: {state}\n"
         f"environment: {environment}\n"
@@ -189,9 +227,12 @@ def _status_text(db_path: str) -> str:
         f"open_paper_positions: {len(paper_positions)}\n"
         f"reason: {control.reason}\nsource: {control.source}\nupdated_at: {control.updated_at}\n"
         f"trading_service: {heartbeat_text} healthy={heartbeat_healthy}\n"
+        f"fill_notice: {_worker_status(fill_status)} heartbeat={fill_heartbeat_text} healthy={fill_healthy}\n"
+        f"order_supervisor: {_worker_status(supervisor_status)} heartbeat={supervisor_heartbeat_text} healthy={supervisor_healthy}\n"
         f"operator_review: {_safe_flag(operator_review)}\n"
         f"block_new_entries: {_safe_flag(block_entries)}\n"
-        f"emergency_stop: {_safe_flag(emergency)}"
+        f"emergency_stop: {_safe_flag(emergency)}\n"
+        f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}"
     )
 
 
@@ -242,6 +283,19 @@ def _safe_flag(value: str | None) -> str:
     if value is None:
         return "unavailable"
     return "true" if value.strip().lower() in {"1", "true", "yes", "on"} else "false"
+
+
+def _worker_status(value: str | None) -> str:
+    if not value:
+        return "unavailable"
+    candidate = value
+    try:
+        payload = json.loads(value)
+        if isinstance(payload, dict):
+            candidate = str(payload.get("status") or "unavailable")
+    except (TypeError, ValueError):
+        pass
+    return candidate if candidate.replace("_", "").replace("-", "").isalnum() else "unavailable"
 
 
 def _heartbeat_status(value: str | None) -> tuple[str, bool]:
@@ -457,8 +511,13 @@ def handle_update(
         reason = "telegram_operator"
         if command and " " in command[0]:
             reason = command[0].split(" ", 1)[1]
+        resume_safety_reason = _resume_safety_reason(db_path)
         if _emergency_stop_active(db_path):
             text = "resume rejected: emergency stop is active; use /clear-emergency while paused"
+        elif (_metadata(db_path, CANCEL_OPEN_BUYS_KEY) or "").strip().lower() in {"1", "true", "yes", "on"}:
+            text = "resume rejected: open BUY cancellation is still pending"
+        elif resume_safety_reason is not None:
+            text = f"resume rejected: {resume_safety_reason}"
         elif not _real_resume_allowed(db_path):
             text = "resume rejected: real environment requires a fresh challenge confirmation"
         else:
@@ -494,9 +553,21 @@ def handle_update(
     elif command_name in {"/emergency-stop", "emergency-stop"}:
         set_paused(db_path, True, "telegram_emergency_stop", "telegram")
         _set_metadata(db_path, EMERGENCY_STOP_KEY, "true")
+        cancellation_requested = _request_open_buy_cancellation(db_path)
         _set_metadata(db_path, REAL_RESUME_ARM_EXPIRES_KEY, "")
         _set_metadata(db_path, REAL_RESUME_ARM_USES_KEY, "0")
-        text = "emergency stop active; runtime paused"
+        text = (
+            "emergency stop active; runtime paused; open BUY cancellation requested"
+            if cancellation_requested
+            else "emergency stop active; runtime paused; no open BUY orders"
+        )
+    elif command_name in {"/cancel-open-buys", "cancel-open-buys"}:
+        set_paused(db_path, True, "telegram_cancel_open_buys", "telegram")
+        text = (
+            "runtime paused; open BUY cancellation requested"
+            if _request_open_buy_cancellation(db_path)
+            else "runtime paused; no open BUY orders"
+        )
     elif command_name in {"/environment:demo", "/environment:real"}:
         value = command_name.split(":", 1)[1]
         if value == "real":

@@ -9,7 +9,7 @@ Portainer 호스트에서 다음을 준비합니다.
 - Docker와 Portainer가 정상 동작하는지 확인합니다.
 - Git 저장소에 접근할 수 있는 URL, 브랜치, compose 파일 경로를 준비합니다.
 - `DATA_DIR`로 사용할 호스트의 영속 디렉터리를 만들고 컨테이너 사용자 UID `10001`이 읽고 쓸 수 있게 합니다.
-- KIS demo 앱·계좌, Telegram bot·허용 chat id, OpenAI API 키를 준비합니다.
+- KIS demo 앱·계좌·HTS 사용자/로그인 ID, Telegram bot·허용 chat id, OpenAI API 키를 준비합니다.
 - Git 저장소와 Stack 환경변수에 비밀값을 커밋하지 않습니다. 아래의 `<...>`는 실제 값으로 바꿔 Portainer UI에만 입력합니다.
 
 `trading-service`는 Compose에서 profile이 없는 기본 서비스입니다. Stack 배포 시 이 서비스가 기본으로 올라오며, `app`, smoke, collector, `telegram-poll`, `auto-trade-cycle`은 보조 프로파일입니다. 운영 중 `auto-trade-cycle`을 별도로 실행하면 주문 경로가 중복될 수 있으므로 함께 실행하지 않습니다.
@@ -47,8 +47,14 @@ OPENAI_API_KEY=<OPENAI_API_KEY>
 OPENAI_MODEL=gpt-4o-mini
 AUTO_TRADE_AI=openai
 AUTO_TRADE_MAX_QUANTITY=1
-AUTO_TRADE_COLLECT_SECONDS=50
-AUTO_TRADE_CYCLE_INTERVAL_SECONDS=60
+AUTO_TRADE_COLLECT_SECONDS=10
+AUTO_TRADE_CYCLE_INTERVAL_SECONDS=20
+KIS_HTS_ID=<KIS_HTS_LOGIN_ID>
+ORDER_SUPERVISOR_INTERVAL_SECONDS=5
+OPENAI_TIMEOUT_SECONDS=8
+OPENAI_MAX_RETRIES=1
+OPENAI_MAX_RESPONSE_AGE_SECONDS=20
+AUTO_TRADE_DECISION_DEADLINE_SECONDS=25
 DATA_DIR=/srv/kis-ai-scalper/data
 BUY_ORDER_TTL_SECONDS=60
 SELL_ORDER_TTL_SECONDS=30
@@ -83,7 +89,15 @@ LIVE_TRADING_ENABLED=true
 
 demo 주문에는 `TRADING_MODE=micro_live` 또는 `live`가 필요합니다. real 주문에는 `TRADING_MODE=live`가 필요합니다. `KIS_ENV`는 smoke·단발 CLI의 대상이고, 장기 실행 `trading-service`의 runtime environment는 SQLite에 저장되어 Telegram `/env`로 관리됩니다. real 전환에는 KIS real 키·계정도 필요합니다.
 
-`AUTO_TRADE_COLLECT_SECONDS=50`은 현재 Compose 기본값이자 서비스 권장 수집 시간입니다. 이전 배포본에서 10초를 명시했다면 Stack 환경변수를 `50`으로 갱신합니다.
+서비스 기본값은 수집 10초, cycle 간격 20초입니다. 수집이 끝난 직후 계좌·risk snapshot을 새로 읽습니다. AI 판단은 deterministic 후보가 있을 때만, 같은 bar에서는 한 번만 수행하며 25초 deadline·8초 timeout·1회 재시도를 사용하고 KIS 현재가를 응답 뒤 재검증합니다.
+
+`KIS_HTS_ID`는 앱 키·시크릿·계좌번호가 아니라 KIS HTS 사용자/로그인 ID입니다. 실시간 체결통보 event-driven 처리를 위해 강하게 권장되며, 운영 주문에서는 입력을 필수로 취급합니다. 실전은 `H0STCNI0`, 모의는 `H0STCNI9`를 사용합니다. 체결통보 worker를 사용할 수 없는 동안에도 REST 주문 supervisor가 `ORDER_SUPERVISOR_INTERVAL_SECONDS=5`로 fallback합니다.
+
+배포 호스트에서는 주문 없이 구독 ACK를 확인할 수 있습니다.
+
+```powershell
+docker compose --profile smoke run --rm smoke-fill-notice
+```
 
 ## 3. 첫 기동 확인
 
@@ -93,6 +107,7 @@ demo 주문에는 `TRADING_MODE=micro_live` 또는 `live`가 필요합니다. re
 - Healthcheck가 시작 유예 후 정상인지 확인합니다. heartbeat가 180초를 넘으면 healthcheck가 비정상으로 판단합니다.
 - 로그에 `runtime: paused`와 서비스 시작 알림이 있는지 확인합니다.
 - Stack을 재배포하거나 컨테이너가 재시작되어도 runtime은 항상 paused로 시작합니다.
+- paused 상태에서도 preflight와 게이트가 유효하면 supervisor가 잔고·주문을 대조하고 heartbeat를 갱신합니다. 이 상태에서는 신규 주문을 제출하지 않습니다.
 - `DATA_DIR`가 `/app/data`에 연결되었는지 확인합니다. SQLite와 token cache는 컨테이너 내부 임시 영역에 두지 않습니다.
 
 Telegram에서 다음 순서로 확인합니다.
@@ -104,6 +119,7 @@ Telegram에서 다음 순서로 확인합니다.
 /positions
 /orders
 /fills
+/cancel-open-buys
 /env demo
 ```
 
@@ -147,8 +163,11 @@ Telegram에서 다음 순서로 확인합니다.
 /live-report
 /cost
 /emergency-stop
+/cancel-open-buys
 /clear-emergency
 ```
+
+`/control`의 **Cancel open buys** 버튼도 `/cancel-open-buys`와 같습니다. `/emergency-stop`과 `/cancel-open-buys`는 paused로 전환하고 local ledger에 알려진 open BUY만 취소 요청합니다. broker가 `CANCELLED` 등 terminal 상태를 확인할 때까지 `CANCEL_PENDING`으로 유지하며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
 
 real 전환은 다음의 다단계 확인입니다.
 
@@ -164,7 +183,9 @@ real runtime에서 pause하거나 `/emergency-stop`을 사용하면 resume arm�
 
 ### 잔고와 주문 불일치
 
-service cycle은 KIS 주문 상태·계좌 snapshot과 local ledger를 대조합니다.
+service cycle은 시세 수집 후 새로 읽은 KIS 주문 상태·계좌/risk snapshot과 local ledger를 대조합니다.
+
+KIS 체결통보 worker는 실전 `H0STCNI0`, 모의 `H0STCNI9`를 사용해 접수·체결·부분 체결을 ledger에 반영합니다. `/status`에서 worker 상태와 heartbeat를 확인합니다. worker가 `KIS_HTS_ID` 누락 또는 연결 문제로 unavailable이면 REST order supervisor가 5초 주기로 보완합니다.
 
 - broker에만 있는 기존 잔고는 local position으로 자동 채택하지 않습니다.
 - local에만 있거나 수량이 다른 position은 자동 청산하지 않습니다.
@@ -196,16 +217,18 @@ service cycle은 KIS 주문 상태·계좌 snapshot과 local ledger를 대조합
 3. `/status`, `/positions`, `/orders`, `/fills`와 heartbeat를 확인합니다.
 4. read-only smoke와 watchlist를 확인합니다.
 5. demo 주문을 검증할 때만 두 live gate를 `true`로 바꾸고 재배포한 뒤, 다시 `/status`를 확인하고 `/resume`합니다.
+6. `/status`에서 체결통보 worker 또는 REST supervisor의 상태·heartbeat를 확인합니다.
 
 화요일부터 금요일까지:
 
 - 매일 장 시작 시 pause·environment·heartbeat·operator review·신규진입 차단 플래그를 기록합니다.
 - BUY/SELL 접수, 체결, 부분 체결, 미체결, BUY 60초·SELL 30초 취소와 terminal 확정을 기록합니다.
+- 실제 demo 장중 BUY, 부분 체결, 취소, SELL을 모두 검증합니다. 이 검증이 끝나기 전에는 real로 전환하지 않습니다.
 - 고위험 승인 2분 만료와 승인 후 조건 재검사를 확인합니다.
 - broker-only·local-only·수량 불일치가 한 번이라도 생기면 신규진입을 차단한 채 원인을 조사합니다.
 - 장 마감 후 `/report`, `/live-report`, `/orders`, `/fills`와 관련 로그를 백업합니다.
 
-금요일에는 KIS demo 응답과 local ledger의 일치 여부, service 재시작 후 항상 paused가 되는지, Telegram 제어와 알림이 동작하는지를 검토합니다. 미확인 항목이 하나라도 있으면 real로 전환하지 않습니다.
+금요일에는 KIS demo 응답과 local ledger의 일치 여부, service 재시작 후 항상 paused가 되는지, Telegram 제어와 알림이 동작하는지를 검토합니다. 실제 장중 demo BUY·부분 체결·취소·SELL 검증이 남아 있거나 미확인 항목이 하나라도 있으면 real로 전환하지 않습니다.
 
 ## 8. 영속화와 백업
 

@@ -42,6 +42,20 @@ services:
       - ./data:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "smoke-ws", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930", "--seconds", "10"]
     profiles: ["smoke"]
+  smoke-fill-notice:
+    build:
+      context: .
+      target: runtime
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-shadow}"
+      CONFIG_LIVE_TRADING_ENABLED: "false"
+      LIVE_TRADING_ENABLED: "false"
+      KIS_ENV: "${KIS_ENV:-demo}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: ["python", "-m", "kis_ai_scalper.cli", "smoke-fill-notice", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--seconds", "10"]
+    profiles: ["smoke"]
   collector:
     build:
       context: .
@@ -85,7 +99,7 @@ services:
       "--db", "data/kis_ai_scalper.sqlite3",
       "--ai", "${AUTO_TRADE_AI:-openai}",
       "--max-quantity", "${AUTO_TRADE_MAX_QUANTITY:-1}",
-      "--collect-seconds", "${AUTO_TRADE_COLLECT_SECONDS:-50}",
+      "--collect-seconds", "${AUTO_TRADE_COLLECT_SECONDS:-10}",
       "--notify-telegram",
       "--confirm", "AUTO_TRADE"
     ]
@@ -124,6 +138,7 @@ services:
       KIS_REAL_APP_SECRET: "${KIS_REAL_APP_SECRET:-}"
       KIS_REAL_ACCOUNT_NO: "${KIS_REAL_ACCOUNT_NO:-}"
       KIS_REAL_ACCOUNT_PRODUCT_CODE: "${KIS_REAL_ACCOUNT_PRODUCT_CODE:-01}"
+      KIS_HTS_ID: "${KIS_HTS_ID:-}"
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_ALLOWED_CHAT_ID: "${TELEGRAM_ALLOWED_CHAT_ID:-}"
       TELEGRAM_ALLOWED_USER_ID: "${TELEGRAM_ALLOWED_USER_ID:-}"
@@ -135,10 +150,14 @@ services:
       OPENAI_MAX_DAILY_CALLS: "${OPENAI_MAX_DAILY_CALLS:-1000}"
       OPENAI_MAX_PROCESS_COST_USD: "${OPENAI_MAX_PROCESS_COST_USD:-10.0}"
       OPENAI_MAX_DAILY_COST_USD: "${OPENAI_MAX_DAILY_COST_USD:-25.0}"
+      OPENAI_MAX_RESPONSE_AGE_SECONDS: "${OPENAI_MAX_RESPONSE_AGE_SECONDS:-20}"
+      OPENAI_TIMEOUT_SECONDS: "${OPENAI_TIMEOUT_SECONDS:-8}"
+      OPENAI_MAX_RETRIES: "${OPENAI_MAX_RETRIES:-1}"
       AUTO_TRADE_AI: "${AUTO_TRADE_AI:-openai}"
       AUTO_TRADE_MAX_QUANTITY: "${AUTO_TRADE_MAX_QUANTITY:-1}"
-      AUTO_TRADE_COLLECT_SECONDS: "${AUTO_TRADE_COLLECT_SECONDS:-50}"
-      AUTO_TRADE_CYCLE_INTERVAL_SECONDS: "${AUTO_TRADE_CYCLE_INTERVAL_SECONDS:-60}"
+      AUTO_TRADE_DECISION_DEADLINE_SECONDS: "${AUTO_TRADE_DECISION_DEADLINE_SECONDS:-25}"
+      AUTO_TRADE_COLLECT_SECONDS: "${AUTO_TRADE_COLLECT_SECONDS:-10}"
+      AUTO_TRADE_CYCLE_INTERVAL_SECONDS: "${AUTO_TRADE_CYCLE_INTERVAL_SECONDS:-20}"
       AUTO_TRADE_ALLOCATED_KRW: "${AUTO_TRADE_ALLOCATED_KRW:-3000000}"
       RISK_PER_TRADE_PCT: "${RISK_PER_TRADE_PCT:-0.3}"
       MAX_POSITION_PCT: "${MAX_POSITION_PCT:-10}"
@@ -153,6 +172,7 @@ services:
       MARKET_BAR_RETENTION_DAYS: "${MARKET_BAR_RETENTION_DAYS:-365}"
       BUY_ORDER_TTL_SECONDS: "${BUY_ORDER_TTL_SECONDS:-60}"
       SELL_ORDER_TTL_SECONDS: "${SELL_ORDER_TTL_SECONDS:-30}"
+      ORDER_SUPERVISOR_INTERVAL_SECONDS: "${ORDER_SUPERVISOR_INTERVAL_SECONDS:-5}"
       SERVICE_HEARTBEAT_MAX_AGE_SECONDS: "${SERVICE_HEARTBEAT_MAX_AGE_SECONDS:-180}"
     volumes:
       - ${DATA_DIR:-./data}:/app/data
@@ -173,6 +193,6 @@ services:
       "--db", "data/kis_ai_scalper.sqlite3",
       "--ai", "${AUTO_TRADE_AI:-openai}",
       "--max-quantity", "${AUTO_TRADE_MAX_QUANTITY:-1}",
-      "--collect-seconds", "${AUTO_TRADE_COLLECT_SECONDS:-50}",
-      "--cycle-interval-seconds", "${AUTO_TRADE_CYCLE_INTERVAL_SECONDS:-60}"
+      "--collect-seconds", "${AUTO_TRADE_COLLECT_SECONDS:-10}",
+      "--cycle-interval-seconds", "${AUTO_TRADE_CYCLE_INTERVAL_SECONDS:-20}"
     ]
