@@ -1,0 +1,58 @@
+from datetime import datetime, timedelta
+
+from kis_ai_scalper.indicators.moving_average import ema, sma
+from kis_ai_scalper.indicators.volume import volume_average, volume_ratio
+from kis_ai_scalper.indicators.vwap import vwap
+from kis_ai_scalper.market.features import build_feature_snapshot
+from kis_ai_scalper.market.tick import MinuteBar
+from kis_ai_scalper.strategies.candidate import scan_candidates
+
+
+def make_bars(closes, volumes=None):
+    volumes = volumes or [100] * len(closes)
+    start = datetime(2026, 8, 15, 9, 0)
+    return [MinuteBar("005930", start + timedelta(minutes=i), close, close + 1, close - 1, close, volume)
+            for i, (close, volume) in enumerate(zip(closes, volumes))]
+
+
+def test_moving_averages_are_deterministic():
+    assert sma([1, 2, 3, 4], 3) == 3
+    assert ema([1, 2, 3, 4], 3) == 3.0
+    assert sma([1, 2], 3) is None
+    assert ema([1, 2], 3) is None
+
+
+def test_vwap_and_volume_ratio():
+    assert vwap([10, 20], [1, 3]) == 17.5
+    assert volume_average([10, 20, 30], 2) == 25
+    assert volume_ratio([10, 10, 20], 2) == 2
+
+
+def test_feature_snapshot_allows_short_history():
+    snapshot = build_feature_snapshot(make_bars([100, 101, 102], [100, 100, 150]))
+    assert snapshot is not None
+    assert snapshot.symbol == "005930"
+    assert snapshot.latest_close == 102
+    assert snapshot.ema5 is None
+    assert snapshot.ma60 is None
+    assert snapshot.volume_ratio == 1.5
+    assert snapshot.high_n == 102
+
+
+def test_pullback_and_breakout_candidates():
+    rising = list(range(100, 120))
+    pullback = rising + [119]
+    pullback_snapshot = build_feature_snapshot(make_bars(pullback, [100] * 20 + [120]))
+    assert pullback_snapshot is not None
+    assert any(candidate.strategy == "PULLBACK_WATCH" for candidate in scan_candidates(pullback_snapshot))
+
+    breakout = rising + [121]
+    breakout_snapshot = build_feature_snapshot(make_bars(breakout, [100] * 20 + [150]))
+    assert breakout_snapshot is not None
+    assert any(candidate.strategy == "BREAKOUT_WATCH" for candidate in scan_candidates(breakout_snapshot))
+
+
+def test_no_signal_case():
+    snapshot = build_feature_snapshot(make_bars([100] * 25, [100] * 25))
+    assert snapshot is not None
+    assert scan_candidates(snapshot) == []

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kis-ai-scalper"
+version = "0.1.0"
+description = "Safety-first Korean equity AI scalping system skeleton"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "exchange_calendars>=4.5,<5",
+    "pydantic>=2.7,<3",
+    "PyYAML>=6.0,<7",
+    "requests>=2.31,<3",
+    "websockets>=12,<16",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9"]
+
+[tool.setuptools.packages.find]
+include = ["kis_ai_scalper*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.tmp_pytest -p no:cacheprovider"

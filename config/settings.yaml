@@ -1,0 +1,3 @@
+mode: shadow
+log_level: INFO
+decision_schema_path: schemas/trade_decision.schema.json

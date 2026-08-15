@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest-tmp/
+.tmp_pytest*/
+.venv/
+.env
+.env.*
+!.env.example
+config/*.local.yaml
+data/
+logs/
+*.sqlite3
+.idea/
+.vscode/

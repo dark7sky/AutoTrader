@@ -1,0 +1,93 @@
+services:
+  app:
+    build: .
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-shadow}"
+      LIVE_TRADING_ENABLED: "${LIVE_TRADING_ENABLED:-false}"
+    command: ["python", "-m", "pytest"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import kis_ai_scalper"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  smoke-kis:
+    build: .
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-shadow}"
+      LIVE_TRADING_ENABLED: "${LIVE_TRADING_ENABLED:-false}"
+      KIS_ENV: "${KIS_ENV:-demo}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: ["python", "-m", "kis_ai_scalper.cli", "smoke-kis", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930"]
+  smoke-ws:
+    build: .
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-shadow}"
+      LIVE_TRADING_ENABLED: "${LIVE_TRADING_ENABLED:-false}"
+      KIS_ENV: "${KIS_ENV:-demo}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: ["python", "-m", "kis_ai_scalper.cli", "smoke-ws", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930", "--seconds", "10"]
+  collector:
+    build: .
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-shadow}"
+      LIVE_TRADING_ENABLED: "${LIVE_TRADING_ENABLED:-false}"
+      KIS_ENV: "${KIS_ENV:-demo}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: ["python", "-m", "kis_ai_scalper.cli", "collect-market", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930", "--seconds", "60", "--db", "data/kis_ai_scalper.sqlite3"]
+  telegram-poll:
+    build: .
+    profiles: ["ops"]
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: ["python", "-m", "kis_ai_scalper.cli", "telegram-poll", "--db", "data/kis_ai_scalper.sqlite3", "--limit", "10", "--timeout-seconds", "5"]
+  auto-trade-cycle:
+    build: .
+    profiles: ["trade"]
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-micro_live}"
+      LIVE_TRADING_ENABLED: "${LIVE_TRADING_ENABLED:-false}"
+      KIS_ENV: "${KIS_ENV:-demo}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: [
+      "python", "-m", "kis_ai_scalper.cli", "auto-trade-cycle",
+      "--config", "config/settings.yaml",
+      "--env", "${KIS_ENV:-demo}",
+      "--db", "data/kis_ai_scalper.sqlite3",
+      "--ai", "${AUTO_TRADE_AI:-openai}",
+      "--max-quantity", "${AUTO_TRADE_MAX_QUANTITY:-1}",
+      "--collect-seconds", "${AUTO_TRADE_COLLECT_SECONDS:-10}",
+      "--notify-telegram",
+      "--confirm", "AUTO_TRADE"
+    ]
+  trading-service:
+    build: .
+    profiles: ["trade"]
+    restart: unless-stopped
+    environment:
+      TRADING_MODE: "${TRADING_MODE:-micro_live}"
+      LIVE_TRADING_ENABLED: "${LIVE_TRADING_ENABLED:-false}"
+      AUTO_TRADE_AI: "${AUTO_TRADE_AI:-openai}"
+      AUTO_TRADE_MAX_QUANTITY: "${AUTO_TRADE_MAX_QUANTITY:-1}"
+      AUTO_TRADE_COLLECT_SECONDS: "${AUTO_TRADE_COLLECT_SECONDS:-10}"
+      AUTO_TRADE_CYCLE_INTERVAL_SECONDS: "${AUTO_TRADE_CYCLE_INTERVAL_SECONDS:-60}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    command: [
+      "python", "-m", "kis_ai_scalper.cli", "service-loop",
+      "--config", "config/settings.yaml",
+      "--db", "data/kis_ai_scalper.sqlite3",
+      "--ai", "${AUTO_TRADE_AI:-openai}",
+      "--max-quantity", "${AUTO_TRADE_MAX_QUANTITY:-1}",
+      "--collect-seconds", "${AUTO_TRADE_COLLECT_SECONDS:-10}",
+      "--cycle-interval-seconds", "${AUTO_TRADE_CYCLE_INTERVAL_SECONDS:-60}"
+    ]
