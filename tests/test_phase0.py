@@ -5,14 +5,14 @@ import pytest
 from pydantic import ValidationError
 
 from kis_ai_scalper.config import load_config
-from kis_ai_scalper.schemas import AIAction, TradeDecision, TradingMode
+from kis_ai_scalper.schemas import AIAction, TradeDecision
 
 
 ROOT = Path(__file__).parents[1]
 CONFIG = ROOT / "config" / "settings.yaml"
 
 
-def test_config_defaults_to_shadow_and_loads_api_credentials_without_account():
+def test_config_loads_api_credentials_without_account_and_has_no_execution_mode_fields():
     config = load_config(
         CONFIG,
         {
@@ -20,8 +20,8 @@ def test_config_defaults_to_shadow_and_loads_api_credentials_without_account():
             "KIS_DEMO_APP_SECRET": "test-secret",
         },
     )
-    assert config.mode is TradingMode.SHADOW
-    assert config.live_trading_enabled is False
+    assert not hasattr(config, "mode")
+    assert not hasattr(config, "live_trading_enabled")
     assert config.kis_api_for("demo") is not None
     assert config.kis_api_for("demo").app_secret == "test-secret"
     assert config.kis_account_for("demo") is None
@@ -119,28 +119,45 @@ def test_trade_decision_validation():
         TradeDecision.model_validate({**decision.model_dump(), "quantity": 1})
 
 
-def test_live_mode_requires_explicit_gate(tmp_path):
-    with pytest.raises(ValueError, match="live mode"):
-        load_config(CONFIG, {"TRADING_MODE": "live", "LIVE_TRADING_ENABLED": "false"})
-
-    with pytest.raises(ValueError, match="YAML"):
-        load_config(CONFIG, {"TRADING_MODE": "live", "LIVE_TRADING_ENABLED": "true"})
-
-    live_config = tmp_path / "live-settings.yaml"
-    live_config.write_text(
-        "mode: live\nlive_trading_enabled: true\n",
+def test_legacy_mode_and_live_gate_inputs_are_ignored(tmp_path):
+    config_path = tmp_path / "legacy-settings.yaml"
+    config_path.write_text(
+        "mode: this-is-not-a-trading-mode\nlive_trading_enabled: true\n",
         encoding="utf-8",
     )
+
     config = load_config(
-        live_config,
-        {"TRADING_MODE": "live", "LIVE_TRADING_ENABLED": "true"},
+        config_path,
+        {
+            "TRADING_MODE": "also-invalid-and-ignored",
+            "CONFIG_LIVE_TRADING_ENABLED": "false",
+        },
     )
-    assert config.mode is TradingMode.LIVE
+
+    assert not hasattr(config, "mode")
+    assert not hasattr(config, "live_trading_enabled")
 
 
-def test_config_live_trading_enabled_can_be_overridden_by_environment():
-    enabled = load_config(CONFIG, {"CONFIG_LIVE_TRADING_ENABLED": "true"})
-    disabled = load_config(CONFIG, {"CONFIG_LIVE_TRADING_ENABLED": "false"})
+@pytest.mark.parametrize("enabled", [None, "false"])
+def test_broker_orders_are_blocked_without_single_live_gate(monkeypatch, enabled):
+    if enabled is None:
+        monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("LIVE_TRADING_ENABLED", enabled)
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("CONFIG_LIVE_TRADING_ENABLED", "true")
 
-    assert enabled.live_trading_enabled is True
-    assert disabled.live_trading_enabled is False
+    from kis_ai_scalper import cli
+
+    with pytest.raises(ValueError, match="LIVE_TRADING_ENABLED"):
+        cli._assert_broker_order_allowed()
+
+
+def test_broker_orders_use_only_single_live_gate(monkeypatch):
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("TRADING_MODE", "invalid-and-ignored")
+    monkeypatch.setenv("CONFIG_LIVE_TRADING_ENABLED", "false")
+
+    from kis_ai_scalper import cli
+
+    cli._assert_broker_order_allowed()

@@ -29,8 +29,6 @@ Portainer 호스트에서 다음을 준비합니다.
 아래 값은 첫 demo 점검용 기준입니다. 비밀값은 자리표시자이므로 Portainer에서 실제 값으로 교체합니다.
 
 ```dotenv
-TRADING_MODE=micro_live
-CONFIG_LIVE_TRADING_ENABLED=false
 LIVE_TRADING_ENABLED=false
 KIS_ENV=demo
 
@@ -69,25 +67,23 @@ OPENAI_ADMIN_KEY=<OPENAI_ADMIN_KEY>
 OPENAI_USAGE_API_KEY=<OPENAI_USAGE_API_KEY>
 ```
 
-### 주문 기능을 여는 두 게이트
+### 주문 기능 게이트
 
-저장소 기본과 Compose 기본은 모두 주문 차단입니다.
+저장소 기본과 Compose 기본은 `LIVE_TRADING_ENABLED=false`이며 주문이 차단됩니다. 이 값이 주문 제출을 여는 유일한 배포 게이트입니다.
 
 ```dotenv
-CONFIG_LIVE_TRADING_ENABLED=false
 LIVE_TRADING_ENABLED=false
 ```
 
 KIS demo 주문을 실제로 접수시키는 검증 시점에만 Stack 환경변수를 다음처럼 바꾸고 **Update the stack**으로 재배포합니다.
 
 ```dotenv
-CONFIG_LIVE_TRADING_ENABLED=true
 LIVE_TRADING_ENABLED=true
 ```
 
-두 값이 모두 `true`여야 broker 주문 제출이 열립니다. 하나라도 `false`이면 preflight가 주문을 차단합니다. `CONFIG_LIVE_TRADING_ENABLED`는 `config/settings.yaml`의 `live_trading_enabled`를 덮어쓰는 설정 gate이고, `LIVE_TRADING_ENABLED`는 실행 환경 gate입니다. 둘을 혼동하지 않습니다.
+`LIVE_TRADING_ENABLED=true`여도 서비스가 paused 상태이면 주문하지 않습니다. Telegram `/resume`, KRX 거래일·장중 조건, risk 및 불일치 검사를 모두 통과해야 주문할 수 있습니다.
 
-demo 주문에는 `TRADING_MODE=micro_live` 또는 `live`가 필요합니다. real 주문에는 `TRADING_MODE=live`가 필요합니다. `KIS_ENV`는 smoke·단발 CLI의 대상이고, 장기 실행 `trading-service`의 runtime environment는 SQLite에 저장되어 Telegram `/env`로 관리됩니다. real 전환에는 KIS real 키·계정도 필요합니다.
+`KIS_ENV`는 smoke·단발 CLI의 기본 대상입니다. 장기 실행 `trading-service`의 runtime environment는 SQLite에 보존되고 신규 DB에서는 `demo`로 시작합니다. 이후 paused 상태에서 Telegram `/env demo` 또는 `/env real`로 선택합니다. real 전환에는 KIS real 키·계정과 challenge 확인이 필요합니다.
 
 서비스 기본값은 수집 10초, cycle 간격 20초입니다. 수집이 끝난 직후 계좌·risk snapshot을 새로 읽습니다. AI 판단은 deterministic 후보가 있을 때만, 같은 bar에서는 한 번만 수행하며 25초 deadline·8초 timeout·1회 재시도를 사용하고 KIS 현재가를 응답 뒤 재검증합니다.
 
@@ -132,7 +128,7 @@ Telegram에서 다음 순서로 확인합니다.
 1. 주문 게이트를 `false`로 둔 상태에서 Stack 기동, heartbeat, Telegram 연결, watchlist, KIS read-only 조회를 확인합니다.
 2. smoke가 필요한 경우 Portainer에서 보조 프로파일을 별도로 실행하거나 호스트에서 read-only 명령을 실행합니다. 이 도구와 `trading-service`를 중복 운영하지 않습니다.
 3. KRX 거래일과 장중 시각을 확인합니다. 서비스는 `XKRX` 캘린더를 사용하며, 휴장일·장외에는 주문하지 않습니다. 캘린더를 사용할 수 없으면 broker preflight가 fail-closed입니다.
-4. 실제 demo 주문 접수 검증을 시작할 때 Stack 환경변수 두 게이트를 모두 `true`로 바꾸고 Update the stack을 실행합니다.
+4. 실제 demo 주문 접수 검증을 시작할 때 `LIVE_TRADING_ENABLED=true`로 바꾸고 Update the stack을 실행합니다.
 5. 재기동 후에도 paused인지 확인합니다. `/status`에서 `environment=demo`, `operator_review=false`, `block_new_entries=false`를 확인합니다.
 6. 잔고와 local position, active order가 일치하는지 확인하고 `/resume`을 입력합니다.
 7. 장중에는 `/status`, `/live-report`, `/orders`, `/fills`, `/approvals`를 관찰합니다.
@@ -175,7 +171,7 @@ real 전환은 다음의 다단계 확인입니다.
 2. `/env real`을 입력하면 6자리 challenge가 발급됩니다. challenge는 5분 후 만료되며, 이 단계만으로 real 환경으로 바뀌지 않습니다.
 3. `/confirm-real <challenge>`를 paused 상태에서 입력합니다.
 4. 확인이 성공하면 runtime environment가 real로 선택되고, 15분 동안 1회만 사용할 수 있는 resume arm이 생깁니다.
-5. `TRADING_MODE=live`, `CONFIG_LIVE_TRADING_ENABLED=true`, `LIVE_TRADING_ENABLED=true`, KIS real 키·계정을 확인한 뒤 `/resume`을 입력합니다.
+5. `LIVE_TRADING_ENABLED=true`, KIS real 키·계정과 runtime 대상 real 선택을 확인한 뒤 `/resume`을 입력합니다.
 
 real runtime에서 pause하거나 `/emergency-stop`을 사용하면 resume arm이 사라집니다. `/clear-emergency`도 paused 상태에서만 가능하며, 이후에는 새 real challenge가 필요합니다. 실계좌 전환은 demo 1주 검증 결과와 운영자 승인이 없는 상태에서 수행하지 않습니다.
 
@@ -213,10 +209,10 @@ KIS 체결통보 worker는 실전 `H0STCNI0`, 모의 `H0STCNI9`를 사용해 접
 월요일 장 시작 전:
 
 1. `DATA_DIR`를 백업하고 KIS demo 계좌와 local DB의 기존 position·active order를 대조합니다.
-2. Stack을 `paused`, `KIS_ENV=demo`, `TRADING_MODE=micro_live`, `AUTO_TRADE_MAX_QUANTITY=1`로 기동합니다.
+2. Stack을 `paused`, `KIS_ENV=demo`, `LIVE_TRADING_ENABLED=false`, `AUTO_TRADE_MAX_QUANTITY=1`로 기동합니다.
 3. `/status`, `/positions`, `/orders`, `/fills`와 heartbeat를 확인합니다.
 4. read-only smoke와 watchlist를 확인합니다.
-5. demo 주문을 검증할 때만 두 live gate를 `true`로 바꾸고 재배포한 뒤, 다시 `/status`를 확인하고 `/resume`합니다.
+5. demo 주문을 검증할 때만 `LIVE_TRADING_ENABLED=true`로 바꾸고 재배포한 뒤, 다시 `/status`를 확인하고 `/resume`합니다.
 6. `/status`에서 체결통보 worker 또는 REST supervisor의 상태·heartbeat를 확인합니다.
 
 화요일부터 금요일까지:

@@ -183,9 +183,6 @@ def test_auto_trade_uses_time_after_stream_collection(tmp_path, monkeypatch):
     captured = {}
 
     class FakeConfig:
-        live_trading_enabled = True
-        mode = "micro_live"
-
         def kis_api_for(self, _environment):
             return type("Api", (), {"app_key": "key", "app_secret": "secret"})()
 
@@ -238,9 +235,6 @@ def test_auto_trade_rechecks_runtime_gate_after_collection(tmp_path, monkeypatch
         database.set_runtime_paused(False, "test", "test")
 
     class FakeConfig:
-        live_trading_enabled = True
-        mode = "micro_live"
-
         def kis_api_for(self, _environment):
             return type("Api", (), {"app_key": "key", "app_secret": "secret"})()
 

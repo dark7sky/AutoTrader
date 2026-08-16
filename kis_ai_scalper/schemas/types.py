@@ -4,15 +4,6 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class TradingMode(StrEnum):
-    BACKTEST = "backtest"
-    REPLAY = "replay"
-    SHADOW = "shadow"
-    PAPER = "paper"
-    MICRO_LIVE = "micro_live"
-    LIVE = "live"
-
-
 class AIAction(StrEnum):
     WAIT = "WAIT"
     ARM_LONG = "ARM_LONG"

@@ -34,7 +34,6 @@ from kis_ai_scalper.broker.kis_endpoints import websocket_url
 from kis_ai_scalper.broker.kis_ws import smoke_realtime_price
 from kis_ai_scalper.broker.kis_fill_notice import smoke_fill_notice as smoke_kis_fill_notice
 from kis_ai_scalper.config import load_config
-from kis_ai_scalper.schemas.types import TradingMode
 from kis_ai_scalper.ai.decision import OpenAITradingDecisionClient, RuleBasedAIClient
 from kis_ai_scalper.market.clock import kst_now
 from kis_ai_scalper.market.collector import collect_realtime_prices
@@ -530,7 +529,7 @@ def _runtime_preflight(config_path: str, environment: KisEnvironment, ai: str) -
     for label, check in (
         ("kis_api", lambda: _kis_api_for(config, environment)),
         ("kis_account", lambda: _kis_account_for(config, environment)),
-        ("broker_gate", lambda: _assert_broker_order_allowed(config, environment)),
+        ("broker_gate", _assert_broker_order_allowed),
         ("exchange_calendar", lambda: _assert_exchange_calendar_available()),
         ("risk_config", _risk_config_from_env),
     ):
@@ -1017,19 +1016,9 @@ def _notify_order_management_alert(
     )
 
 
-def _assert_broker_order_allowed(config, environment: KisEnvironment) -> None:
-    if not (config.live_trading_enabled and _env_live_trading_enabled()):
-        raise ValueError(
-            "broker order submission requires configured live_trading_enabled=true "
-            "and LIVE_TRADING_ENABLED=true"
-        )
-    if environment is KisEnvironment.REAL and config.mode is not TradingMode.LIVE:
-        raise ValueError("real broker orders require TRADING_MODE=live")
-    if environment is KisEnvironment.DEMO and config.mode not in {
-        TradingMode.MICRO_LIVE,
-        TradingMode.LIVE,
-    }:
-        raise ValueError("demo broker orders require TRADING_MODE=micro_live or live")
+def _assert_broker_order_allowed() -> None:
+    if not _env_live_trading_enabled():
+        raise ValueError("broker order submission requires LIVE_TRADING_ENABLED=true")
 
 
 def _account_components(account_no: str, account_product_code: str) -> tuple[str, str]:
@@ -1257,7 +1246,7 @@ def submit_live_shadow_order(
     config = load_config(Path(config_path))
     kis_api = _kis_api_for(config, env)
     kis_account = _kis_account_for(config, env)
-    _assert_broker_order_allowed(config, env)
+    _assert_broker_order_allowed()
     account_no, account_product_code = _account_components(
         kis_account.account_no,
         kis_account.account_product_code,
@@ -1400,7 +1389,7 @@ def auto_trade_cycle(
     config = load_config(Path(config_path))
     kis_api = _kis_api_for(config, env)
     kis_account = _kis_account_for(config, env)
-    _assert_broker_order_allowed(config, env)
+    _assert_broker_order_allowed()
     account_no, account_product_code = _account_components(
         kis_account.account_no,
         kis_account.account_product_code,

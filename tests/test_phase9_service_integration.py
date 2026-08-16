@@ -98,8 +98,6 @@ def test_cli_openai_client_receives_dotenv_model_and_budget_explicitly(tmp_path,
     monkeypatch.setattr(cli, "_assert_broker_order_allowed", lambda *_: None)
     monkeypatch.setattr(cli, "load_config", lambda _: type(
         "Config", (), {
-            "live_trading_enabled": True,
-            "mode": "micro_live",
             "kis_api_for": lambda self, _: type("Api", (), {"app_key": "a", "app_secret": "s"})(),
             "kis_account_for": lambda self, _: type("Account", (), {"account_no": "12345678", "account_product_code": "01"})(),
         }

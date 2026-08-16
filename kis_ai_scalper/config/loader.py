@@ -8,9 +8,6 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from kis_ai_scalper.schemas.types import TradingMode
-
-
 class KisApiCredentials(BaseModel):
     """KIS app credentials needed for authentication and market data."""
 
@@ -28,23 +25,12 @@ class KisAccountInfo(BaseModel):
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: TradingMode = TradingMode.SHADOW
     log_level: str = "INFO"
     decision_schema_path: str = "schemas/trade_decision.schema.json"
-    live_trading_enabled: bool = False
     kis_demo_api: KisApiCredentials | None = None
     kis_real_api: KisApiCredentials | None = None
     kis_demo_account: KisAccountInfo | None = None
     kis_real_account: KisAccountInfo | None = None
-
-    def assert_execution_allowed(self, env_live_trading_enabled: bool = False) -> None:
-        if self.mode is TradingMode.LIVE and not (
-            self.live_trading_enabled and env_live_trading_enabled
-        ):
-            raise ValueError(
-                "live mode requires YAML live_trading_enabled=true and "
-                "LIVE_TRADING_ENABLED=true"
-            )
 
     def kis_api_for(self, environment: str) -> KisApiCredentials | None:
         if environment == "real":
@@ -101,15 +87,10 @@ def load_config(path: str | Path, environ: dict[str, str] | None = None) -> AppC
     if forbidden.intersection(raw):
         raise ValueError("KIS secrets must not be stored in YAML")
     raw = dict(raw)
-    raw["mode"] = env.get("TRADING_MODE", raw.get("mode", TradingMode.SHADOW.value))
-    yaml_live_trading_enabled = raw.get("live_trading_enabled", False)
-    config_live_trading_enabled = env.get("CONFIG_LIVE_TRADING_ENABLED")
-    env_live_trading_enabled = env.get("LIVE_TRADING_ENABLED", "false").lower() == "true"
-    raw["live_trading_enabled"] = (
-        config_live_trading_enabled.lower() == "true"
-        if config_live_trading_enabled is not None
-        else yaml_live_trading_enabled
-    )
+    # Ignore retired settings so existing deployments can upgrade without a
+    # configuration outage. Broker orders are gated by LIVE_TRADING_ENABLED.
+    raw.pop("mode", None)
+    raw.pop("live_trading_enabled", None)
     demo_secret_names = ("KIS_DEMO_APP_KEY", "KIS_DEMO_APP_SECRET")
     real_secret_names = ("KIS_REAL_APP_KEY", "KIS_REAL_APP_SECRET")
     if all(env.get(name) for name in demo_secret_names):
@@ -132,6 +113,4 @@ def load_config(path: str | Path, environ: dict[str, str] | None = None) -> AppC
             account_no=env["KIS_REAL_ACCOUNT_NO"],
             account_product_code=env.get("KIS_REAL_ACCOUNT_PRODUCT_CODE", "01"),
         )
-    config = AppConfig.model_validate(raw)
-    config.assert_execution_allowed(env_live_trading_enabled)
-    return config
+    return AppConfig.model_validate(raw)
