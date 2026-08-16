@@ -13,7 +13,8 @@ __pycache__/
 .env.*
 !.env.example
 config/*.local.yaml
-data/
+data/*
+!data/.gitkeep
 logs/
 *.sqlite3
 .idea/
