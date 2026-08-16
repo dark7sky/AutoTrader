@@ -21,7 +21,7 @@ services:
       KIS_ENV: "${KIS_ENV:-demo}"
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "smoke-kis", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930"]
     profiles: ["smoke"]
   smoke-ws:
@@ -33,7 +33,7 @@ services:
       KIS_ENV: "${KIS_ENV:-demo}"
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "smoke-ws", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930", "--seconds", "10"]
     profiles: ["smoke"]
   smoke-fill-notice:
@@ -45,7 +45,7 @@ services:
       KIS_ENV: "${KIS_ENV:-demo}"
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "smoke-fill-notice", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--seconds", "10"]
     profiles: ["smoke"]
   collector:
@@ -57,7 +57,7 @@ services:
       KIS_ENV: "${KIS_ENV:-demo}"
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "collect-market", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930", "--seconds", "60", "--db", "data/kis_ai_scalper.sqlite3"]
     profiles: ["tools"]
   telegram-poll:
@@ -67,7 +67,7 @@ services:
     profiles: ["ops"]
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "telegram-poll", "--db", "data/kis_ai_scalper.sqlite3", "--limit", "10", "--timeout-seconds", "5"]
   auto-trade-cycle:
     build:
@@ -79,7 +79,7 @@ services:
       KIS_ENV: "${KIS_ENV:-demo}"
     volumes:
       - ./.env:/app/.env:ro
-      - ./data:/app/data
+      - ${DATA_DIR:-./data}:/app/data
     command: [
       "python", "-m", "kis_ai_scalper.cli", "auto-trade-cycle",
       "--config", "config/settings.yaml",
