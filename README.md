@@ -141,9 +141,12 @@ docker compose --profile smoke run --rm smoke-fill-notice
 
 ## Telegram 운영
 
+Telegram에서는 `/start` 또는 `/menu`를 누르면 메인 메뉴가 표시됩니다. 상태·거래·제어·환경·AI 하위 메뉴의 버튼을 따라가면 주요 조회와 제어 기능에 접근할 수 있으며, 각 하위 메뉴에는 메인 메뉴로 돌아가는 버튼이 있습니다. 기존 명령과 `control:`/`approval:` 콜백도 계속 호환됩니다.
+
 주요 명령:
 
 ```text
+/menu             메인 버튼 메뉴
 /control          현재 상태와 제어 버튼
 /status           paused, environment, heartbeat, 불일치 플래그
 /pause [reason]   즉시 일시정지
@@ -166,7 +169,7 @@ docker compose --profile smoke run --rm smoke-fill-notice
 /clear-emergency  paused 상태에서 emergency stop 해제
 ```
 
-`/control`의 **Cancel open buys** 버튼도 같은 동작을 합니다. `/emergency-stop`과 `/cancel-open-buys`는 runtime을 paused로 만들고, local ledger에 알려진 open BUY에 대해서만 취소를 요청합니다. KIS가 terminal 상태를 확인할 때까지 주문은 `CANCEL_PENDING`이며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
+`운용 제어` 메뉴의 **미체결 매수 취소** 버튼도 같은 동작을 합니다. `/emergency-stop`과 `/cancel-open-buys`는 runtime을 paused로 만들고, local ledger에 알려진 open BUY에 대해서만 취소를 요청합니다. KIS가 terminal 상태를 확인할 때까지 주문은 `CANCEL_PENDING`이며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
 
 real 전환 순서:
 

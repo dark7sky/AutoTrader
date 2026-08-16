@@ -70,33 +70,99 @@ class TelegramClient:
             payload["text"] = text
         return self._call("answerCallbackQuery", payload)
 
+    def set_my_commands(self, commands: list[dict[str, str]]) -> dict[str, Any]:
+        return self._call("setMyCommands", {"commands": commands})
 
-KEYBOARD = {
-    "inline_keyboard": [[
-        {"text": "Pause", "callback_data": "control:pause"},
-        {"text": "Resume", "callback_data": "control:resume"},
-    ], [
-        {"text": "Status", "callback_data": "control:status"},
-        {"text": "Paper report", "callback_data": "control:report"},
-    ], [
-        {"text": "OpenAI cost", "callback_data": "control:cost"},
-    ], [
-        {"text": "Demo env", "callback_data": "control:environment:demo"},
-        {"text": "Real env", "callback_data": "control:environment:real"},
-    ], [
-        {"text": "Positions", "callback_data": "control:positions"},
-        {"text": "Live report", "callback_data": "control:live-report"},
-    ], [
-        {"text": "Orders", "callback_data": "control:orders"},
-        {"text": "Fills", "callback_data": "control:fills"},
-        {"text": "Approvals", "callback_data": "control:approvals"},
-    ], [
-        {"text": "Emergency stop", "callback_data": "control:emergency-stop"},
-        {"text": "Clear emergency", "callback_data": "control:clear-emergency"},
-    ], [
-        {"text": "Cancel open buys", "callback_data": "control:cancel-open-buys"},
-    ]]
+    def set_chat_menu_button(
+        self,
+        chat_id: str | int,
+        menu_button: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self._call(
+            "setChatMenuButton",
+            {"chat_id": chat_id, "menu_button": menu_button or {"type": "commands"}},
+        )
+
+
+BOT_COMMANDS = [
+    {"command": "menu", "description": "메인 메뉴"},
+    {"command": "status", "description": "서비스 상태"},
+    {"command": "control", "description": "운용 제어"},
+]
+
+MAIN_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "상태·리포트", "callback_data": "menu:status"},
+            {"text": "계좌·거래", "callback_data": "menu:trading"},
+        ],
+        [
+            {"text": "운용 제어", "callback_data": "menu:control"},
+            {"text": "환경 설정", "callback_data": "menu:environment"},
+        ],
+        [{"text": "AI·비용", "callback_data": "menu:ai"}],
+    ]
 }
+
+STATUS_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "현재 상태", "callback_data": "control:status"},
+            {"text": "라이브 리포트", "callback_data": "control:live-report"},
+        ],
+        [{"text": "페이퍼 리포트", "callback_data": "control:report"}],
+        [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+    ]
+}
+
+TRADING_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "보유 포지션", "callback_data": "control:positions"},
+            {"text": "주문", "callback_data": "control:orders"},
+        ],
+        [
+            {"text": "체결", "callback_data": "control:fills"},
+            {"text": "승인 대기", "callback_data": "control:approvals"},
+        ],
+        [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+    ]
+}
+
+CONTROL_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "일시정지", "callback_data": "control:pause"},
+            {"text": "거래 재개", "callback_data": "control:resume"},
+        ],
+        [{"text": "미체결 매수 취소", "callback_data": "control:cancel-open-buys"}],
+        [
+            {"text": "긴급 정지", "callback_data": "control:emergency-stop"},
+            {"text": "긴급 정지 해제", "callback_data": "control:clear-emergency"},
+        ],
+        [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+    ]
+}
+
+ENVIRONMENT_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "모의투자", "callback_data": "control:environment:demo"},
+            {"text": "실전투자", "callback_data": "control:environment:real"},
+        ],
+        [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+    ]
+}
+
+AI_MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "OpenAI 사용금액", "callback_data": "control:cost"}],
+        [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+    ]
+}
+
+# Backwards-compatible name for callers that imported the original keyboard.
+KEYBOARD = MAIN_MENU_KEYBOARD
 
 
 def _utcnow() -> datetime:
@@ -366,7 +432,11 @@ def _approval_markup(rows: list[Any]) -> dict[str, Any] | None:
             {"text": f"Approve {request_id}", "callback_data": f"approval:approve:{request_id}"},
             {"text": f"Reject {request_id}", "callback_data": f"approval:reject:{request_id}"},
         ])
-    return {"inline_keyboard": buttons} if buttons else None
+    buttons.append([
+        {"text": "계좌·거래", "callback_data": "menu:trading"},
+        {"text": "메인 메뉴", "callback_data": "menu:main"},
+    ])
+    return {"inline_keyboard": buttons}
 
 
 def _approvals_text(db_path: str) -> tuple[str, dict[str, Any] | None]:
@@ -443,10 +513,39 @@ def _callback(update: dict[str, Any]) -> tuple[str, str | int, str, str | int | 
     data = str(callback.get("data") or "")
     callback_id = callback.get("id")
     if chat_id is None or not callback_id or not (
-        data.startswith("control:") or data.startswith("approval:")
+        data.startswith("control:")
+        or data.startswith("approval:")
+        or data.startswith("menu:")
     ):
         return None
     return data, chat_id, callback_id, (callback.get("from") or {}).get("id")
+
+
+def _default_keyboard(command_name: str) -> dict[str, Any]:
+    if command_name in {
+        "/status", "status", "/report", "report", "/live-report", "live-report",
+    }:
+        return STATUS_MENU_KEYBOARD
+    if command_name in {
+        "/positions", "positions", "/orders", "orders", "/fills", "fills",
+        "/approvals", "approvals", "/approval-callback", "/approve", "approve",
+        "/reject", "reject",
+    }:
+        return TRADING_MENU_KEYBOARD
+    if command_name in {
+        "/pause", "pause", "/resume", "resume", "/control", "control",
+        "/emergency-stop", "emergency-stop", "/clear-emergency", "clear-emergency",
+        "/cancel-open-buys", "cancel-open-buys",
+    }:
+        return CONTROL_MENU_KEYBOARD
+    if command_name in {
+        "/env", "env", "/environment", "environment", "/confirm-real", "confirm-real",
+        "/environment:demo", "/environment:real",
+    }:
+        return ENVIRONMENT_MENU_KEYBOARD
+    if command_name in {"/cost", "cost"}:
+        return AI_MENU_KEYBOARD
+    return MAIN_MENU_KEYBOARD
 
 
 def handle_update(
@@ -465,12 +564,35 @@ def handle_update(
     if callback:
         action, chat_id, callback_id, _ = callback
         client.answer_callback_query(callback_id)
-        command_name = "/approval-callback" if action.startswith("approval:") else "/" + action.split(":", 1)[1]
+        if action.startswith("approval:"):
+            command_name = "/approval-callback"
+        elif action.startswith("menu:"):
+            command_name = "/" + action
+        else:
+            command_name = "/" + action.split(":", 1)[1]
     else:
         assert command is not None
         command_name, chat_id = command[0].split(" ", 1)[0], command[1]
     reply_markup = None
-    if command_name == "/approval-callback":
+    if command_name in {"/start", "/menu", "/menu:main"}:
+        text = "메인 메뉴"
+        reply_markup = MAIN_MENU_KEYBOARD
+    elif command_name == "/menu:status":
+        text = _status_text(db_path)
+        reply_markup = STATUS_MENU_KEYBOARD
+    elif command_name == "/menu:trading":
+        text = "계좌·거래 메뉴"
+        reply_markup = TRADING_MENU_KEYBOARD
+    elif command_name == "/menu:control":
+        text = _status_text(db_path)
+        reply_markup = CONTROL_MENU_KEYBOARD
+    elif command_name == "/menu:environment":
+        text = _status_text(db_path)
+        reply_markup = ENVIRONMENT_MENU_KEYBOARD
+    elif command_name == "/menu:ai":
+        text = "AI·비용 메뉴"
+        reply_markup = AI_MENU_KEYBOARD
+    elif command_name == "/approval-callback":
         _, decision, request_id = action.split(":", 2)
         with connect_database(db_path) as database:
             database.init_schema()
@@ -599,10 +721,7 @@ def handle_update(
         return False
     client.send_message(
         chat_id, _truncate(text),
-        reply_markup=reply_markup or (
-            KEYBOARD if command_name in {"/control", "control", "/environment:demo", "/environment:real"}
-            else None
-        ),
+        reply_markup=reply_markup or _default_keyboard(command_name),
     )
     return True
 

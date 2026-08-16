@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import requests
 
+from kis_ai_scalper import cli
+from kis_ai_scalper.ops import telegram as telegram_module
 from kis_ai_scalper.ops.telegram import (
     EMERGENCY_STOP_KEY,
     REAL_CHALLENGE_EXPIRES_KEY,
@@ -32,6 +34,12 @@ class FakeTelegram:
 
     def answer_callback_query(self, callback_query_id, text=None):
         self.answered.append((callback_query_id, text))
+
+    def set_my_commands(self, commands):
+        self.commands = commands
+
+    def set_chat_menu_button(self, chat_id, menu_button=None):
+        self.chat_menu_button = (chat_id, menu_button)
 
 
 def private(text, update_id=None, chat_id=42, user_id=None):
@@ -89,6 +97,80 @@ def test_group_requires_allowed_user_and_callback_checks_callback_actor(tmp_path
     callback["callback_query"]["from"]["id"] = 8
     assert handle_update(callback, path, fake, "-100", "8") is True
     assert fake.answered == [("cb-1", None)]
+
+
+def test_menu_main_callback_exposes_all_operator_sections(tmp_path):
+    path = str(tmp_path / "telegram.sqlite3")
+    fake = FakeTelegram()
+    callback = {
+        "callback_query": {
+            "id": "menu-main",
+            "from": {"id": 42},
+            "data": "menu:main",
+            "message": {"chat": {"id": 42, "type": "private"}},
+        }
+    }
+    assert handle_update(callback, path, fake, "42", "42") is True
+    buttons = [
+        button["callback_data"]
+        for row in fake.sent[-1][2]["inline_keyboard"]
+        for button in row
+    ]
+    assert {"menu:status", "menu:trading", "menu:control", "menu:environment", "menu:ai"} <= set(buttons)
+
+
+def test_menu_callback_preserves_existing_control_and_approval_callbacks(tmp_path):
+    path = str(tmp_path / "telegram.sqlite3")
+    fake = FakeTelegram()
+    control = {
+        "callback_query": {
+            "id": "control-pause",
+            "from": {"id": 42},
+            "data": "control:pause",
+            "message": {"chat": {"id": 42, "type": "private"}},
+        }
+    }
+    assert handle_update(control, path, fake, "42", "42") is True
+    assert fake.answered[-1] == ("control-pause", None)
+
+
+def test_telegram_client_registers_commands_and_chat_menu_button():
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {}}
+
+    class Session:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return Response()
+
+    client = TelegramClient("token", session=Session())
+    client.set_my_commands([
+        {"command": "menu", "description": "메뉴"},
+    ])
+    client.set_chat_menu_button("42")
+    assert [url.rsplit("/", 1)[1] for url, _ in calls] == ["setMyCommands", "setChatMenuButton"]
+
+
+def test_service_start_notification_includes_main_menu_markup(monkeypatch):
+    sent = []
+
+    class FakeClient:
+        def __init__(self, token):
+            self.token = token
+
+        def send_message(self, chat_id, text, reply_markup=None):
+            sent.append((chat_id, text, reply_markup))
+
+    monkeypatch.setattr(telegram_module, "TelegramClient", FakeClient)
+    notifier = cli._TelegramNotifier("token", "42")
+    notifier.send_menu("auto-trade service started\nruntime: paused")
+    assert sent[-1][2] == telegram_module.MAIN_MENU_KEYBOARD
 
 
 def test_real_environment_requires_challenge_confirmation_and_one_time_arm(tmp_path, monkeypatch):

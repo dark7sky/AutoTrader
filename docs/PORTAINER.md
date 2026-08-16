@@ -138,9 +138,12 @@ Telegram에서 다음 순서로 확인합니다.
 
 ## 5. Telegram 제어와 real challenge
 
+Telegram의 `/start` 또는 `/menu`에서 메인 메뉴를 열고 버튼으로 상태·거래·제어·환경·AI 메뉴에 접근할 수 있습니다. 각 하위 메뉴의 `메인 메뉴` 버튼으로 돌아올 수 있으며, 기존 명령과 승인 버튼도 계속 사용할 수 있습니다.
+
 지원하는 운영 명령은 다음과 같습니다.
 
 ```text
+/menu
 /pause [reason]
 /resume [reason]
 /status
@@ -163,7 +166,7 @@ Telegram에서 다음 순서로 확인합니다.
 /clear-emergency
 ```
 
-`/control`의 **Cancel open buys** 버튼도 `/cancel-open-buys`와 같습니다. `/emergency-stop`과 `/cancel-open-buys`는 paused로 전환하고 local ledger에 알려진 open BUY만 취소 요청합니다. broker가 `CANCELLED` 등 terminal 상태를 확인할 때까지 `CANCEL_PENDING`으로 유지하며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
+`운용 제어` 메뉴의 **미체결 매수 취소** 버튼도 `/cancel-open-buys`와 같습니다. `/emergency-stop`과 `/cancel-open-buys`는 paused로 전환하고 local ledger에 알려진 open BUY만 취소 요청합니다. broker가 `CANCELLED` 등 terminal 상태를 확인할 때까지 `CANCEL_PENDING`으로 유지하며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
 
 real 전환은 다음의 다단계 확인입니다.
 

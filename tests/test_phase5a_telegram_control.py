@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from kis_ai_scalper import cli
+from kis_ai_scalper.ops import telegram as telegram_module
 from kis_ai_scalper.market.collector import CollectorResult
 from kis_ai_scalper.ops.telegram import env_value, handle_update
 from kis_ai_scalper.pipeline import run_paper_session
@@ -18,6 +19,12 @@ class FakeTelegram:
 
     def answer_callback_query(self, callback_query_id, text=None):
         self.answered.append((callback_query_id, text))
+
+    def set_my_commands(self, commands):
+        self.commands = commands
+
+    def set_chat_menu_button(self, chat_id, menu_button=None):
+        self.chat_menu_button = (chat_id, menu_button)
 
 
 def test_runtime_control_defaults_paused_and_round_trips(tmp_path):
@@ -120,6 +127,51 @@ def test_callback_is_acknowledged_and_controls_pause(tmp_path):
     with connect_database(path) as database:
         database.init_schema()
         assert database.get_runtime_control().paused is True
+
+
+def test_start_and_menu_send_main_menu_keyboard(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    fake = FakeTelegram()
+    expected = telegram_module.MAIN_MENU_KEYBOARD
+    update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
+
+    assert handle_update(update("/start"), str(path), fake, "42") is True
+    assert fake.sent[-1][2] == expected
+    assert handle_update(update("/menu"), str(path), fake, "42") is True
+    assert fake.sent[-1][2] == expected
+
+
+def test_menu_callbacks_render_submenus_with_main_return_button(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    fake = FakeTelegram()
+    for callback_name in ("status", "trading", "control", "environment", "ai"):
+        update = {"callback_query": {
+            "id": f"menu-{callback_name}",
+            "from": {"id": 42},
+            "data": f"menu:{callback_name}",
+            "message": {"chat": {"id": 42, "type": "private"}},
+        }}
+        assert handle_update(update, str(path), fake, "42") is True
+        markup = fake.sent[-1][2]
+        callbacks = [
+            button["callback_data"]
+            for row in markup["inline_keyboard"]
+            for button in row
+        ]
+        assert "menu:main" in callbacks
+
+
+def test_menu_callback_requires_authorization(tmp_path):
+    fake = FakeTelegram()
+    update = {"callback_query": {
+        "id": "unauthorized-menu",
+        "from": {"id": 99},
+        "data": "menu:status",
+        "message": {"chat": {"id": 42, "type": "private"}},
+    }}
+    assert handle_update(update, str(tmp_path / "control.sqlite3"), fake, "42", "42") is False
+    assert fake.sent == []
+    assert fake.answered == []
 
 
 def test_telegram_environment_switch_is_pause_gated(tmp_path):

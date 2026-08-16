@@ -636,12 +636,26 @@ def service_loop(
         lease_database.set_runtime_paused(True, "service_start_default_pause", "service")
         try:
             if notifier is not None:
+                install_menu = getattr(notifier, "install_menu", None)
+                if callable(install_menu):
+                    try:
+                        install_menu()
+                    except Exception as exc:
+                        print(
+                            f"telegram menu setup warning: {type(exc).__name__}",
+                            file=sys.stderr,
+                        )
                 try:
-                    notifier.send(
+                    startup_text = (
                         "auto-trade service started\n"
                         "runtime: paused\n"
-                        "Use /control then Resume after env/positions are checked."
+                        "Use the menu after env/positions are checked."
                     )
+                    send_menu = getattr(notifier, "send_menu", None)
+                    if callable(send_menu):
+                        send_menu(startup_text)
+                    else:
+                        notifier.send(startup_text)
                 except Exception as exc:
                     print(f"service startup notification warning: {type(exc).__name__}", file=sys.stderr)
 
@@ -875,7 +889,22 @@ class _TelegramNotifier:
         self.chat_id = chat_id
 
     def send(self, text: str) -> None:
-        self.client.send_message(self.chat_id, text)
+        from kis_ai_scalper.ops.telegram import MAIN_MENU_KEYBOARD
+
+        self.client.send_message(
+            self.chat_id,
+            text,
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+
+    def install_menu(self) -> None:
+        from kis_ai_scalper.ops.telegram import BOT_COMMANDS
+
+        self.client.set_my_commands(BOT_COMMANDS)
+        self.client.set_chat_menu_button(self.chat_id)
+
+    def send_menu(self, text: str) -> None:
+        self.send(text)
 
 
 def _telegram_poll_worker(
