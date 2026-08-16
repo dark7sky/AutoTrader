@@ -23,6 +23,10 @@ class FakeTelegram:
         self.updates = updates or []
         self.get_calls = []
         self.sent = []
+        self.edited = []
+        self.edit_error = None
+        self.deleted = []
+        self.delete_error = None
         self.answered = []
 
     def get_updates(self, **kwargs):
@@ -31,6 +35,16 @@ class FakeTelegram:
 
     def send_message(self, chat_id, text, reply_markup=None):
         self.sent.append((str(chat_id), text, reply_markup))
+
+    def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+        if self.edit_error is not None:
+            raise self.edit_error
+        self.edited.append((str(chat_id), message_id, text, reply_markup))
+
+    def delete_message(self, chat_id, message_id):
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted.append((str(chat_id), message_id))
 
     def answer_callback_query(self, callback_query_id, text=None):
         self.answered.append((callback_query_id, text))
@@ -134,6 +148,63 @@ def test_menu_callback_preserves_existing_control_and_approval_callbacks(tmp_pat
     assert fake.answered[-1] == ("control-pause", None)
 
 
+def test_menu_callback_edits_the_callback_message_without_sending_new_message(tmp_path):
+    path = str(tmp_path / "telegram.sqlite3")
+    fake = FakeTelegram()
+    callback = {
+        "callback_query": {
+            "id": "menu-status",
+            "from": {"id": 42},
+            "data": "menu:status",
+            "message": {
+                "chat": {"id": 42, "type": "private"},
+                "message_id": 314,
+            },
+        }
+    }
+
+    assert handle_update(callback, path, fake, "42", "42") is True
+    assert fake.sent == []
+    assert len(fake.edited) == 1
+    chat_id, message_id, text, markup = fake.edited[0]
+    assert (chat_id, message_id) == ("42", 314)
+    assert "runtime:" in text
+    assert markup == telegram_module.STATUS_MENU_KEYBOARD
+
+
+def test_menu_callback_falls_back_to_send_when_edit_fails(tmp_path):
+    path = str(tmp_path / "telegram.sqlite3")
+    fake = FakeTelegram()
+    fake.edit_error = RuntimeError("message is no longer editable")
+    callback = {
+        "callback_query": {
+            "id": "menu-control",
+            "from": {"id": 42},
+            "data": "menu:control",
+            "message": {
+                "chat": {"id": 42, "type": "private"},
+                "message_id": 315,
+            },
+        }
+    }
+
+    assert handle_update(callback, path, fake, "42", "42") is True
+    assert fake.edited == []
+    assert fake.deleted == [("42", 315)]
+    assert len(fake.sent) == 1
+    assert fake.sent[0][0] == "42"
+    assert fake.sent[0][2] == telegram_module.CONTROL_MENU_KEYBOARD
+
+
+def test_command_input_still_sends_a_new_message(tmp_path):
+    path = str(tmp_path / "telegram.sqlite3")
+    fake = FakeTelegram()
+
+    assert handle_update(private("/status", user_id=42), path, fake, "42", "42") is True
+    assert len(fake.sent) == 1
+    assert fake.edited == []
+
+
 def test_telegram_client_registers_commands_and_chat_menu_button():
     calls = []
 
@@ -155,6 +226,60 @@ def test_telegram_client_registers_commands_and_chat_menu_button():
     ])
     client.set_chat_menu_button("42")
     assert [url.rsplit("/", 1)[1] for url, _ in calls] == ["setMyCommands", "setChatMenuButton"]
+
+
+def test_telegram_client_edit_message_text_uses_exact_api_payload():
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": {}}
+
+    class Session:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return Response()
+
+    client = TelegramClient("token", session=Session())
+    markup = {"inline_keyboard": [[{"text": "메인 메뉴", "callback_data": "menu:main"}]]}
+    client.edit_message_text("42", 314, "상태", reply_markup=markup)
+
+    assert calls == [(
+        "https://api.telegram.org/bottoken/editMessageText",
+        {
+            "chat_id": "42",
+            "message_id": 314,
+            "text": "상태",
+            "reply_markup": markup,
+        },
+    )]
+
+
+def test_telegram_client_delete_message_uses_exact_api_payload():
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True, "result": True}
+
+    class Session:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return Response()
+
+    client = TelegramClient("token", session=Session())
+    client.delete_message("42", 315)
+
+    assert calls == [(
+        "https://api.telegram.org/bottoken/deleteMessage",
+        {"chat_id": "42", "message_id": 315},
+    )]
 
 
 def test_service_start_notification_includes_main_menu_markup(monkeypatch):

@@ -58,6 +58,25 @@ class TelegramClient:
             payload["reply_markup"] = reply_markup
         return self._call("sendMessage", payload)
 
+    def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self._call("editMessageText", payload)
+
+    def delete_message(self, chat_id: str | int, message_id: int) -> dict[str, Any]:
+        return self._call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
     def get_updates(self, *, offset: int | None = None, limit: int = 10, timeout: int = 0) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"limit": limit, "timeout": timeout}
         if offset is not None:
@@ -506,7 +525,9 @@ def _command(update: dict[str, Any]) -> tuple[str, str | int, str | int | None] 
     } else ""), chat_id, user_id
 
 
-def _callback(update: dict[str, Any]) -> tuple[str, str | int, str, str | int | None] | None:
+def _callback(
+    update: dict[str, Any],
+) -> tuple[str, str | int, str, str | int | None, int | None] | None:
     callback = update.get("callback_query") or {}
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -518,7 +539,14 @@ def _callback(update: dict[str, Any]) -> tuple[str, str | int, str, str | int | 
         or data.startswith("menu:")
     ):
         return None
-    return data, chat_id, callback_id, (callback.get("from") or {}).get("id")
+    message_id = message.get("message_id")
+    return (
+        data,
+        chat_id,
+        callback_id,
+        (callback.get("from") or {}).get("id"),
+        int(message_id) if message_id is not None else None,
+    )
 
 
 def _default_keyboard(command_name: str) -> dict[str, Any]:
@@ -562,7 +590,7 @@ def handle_update(
     if allowed_user_id is not None and str(user_id) != str(allowed_user_id):
         return False
     if callback:
-        action, chat_id, callback_id, _ = callback
+        action, chat_id, callback_id, _, callback_message_id = callback
         client.answer_callback_query(callback_id)
         if action.startswith("approval:"):
             command_name = "/approval-callback"
@@ -573,6 +601,7 @@ def handle_update(
     else:
         assert command is not None
         command_name, chat_id = command[0].split(" ", 1)[0], command[1]
+        callback_message_id = None
     reply_markup = None
     if command_name in {"/start", "/menu", "/menu:main"}:
         text = "메인 메뉴"
@@ -719,10 +748,24 @@ def handle_update(
         text = _cost_text()
     else:
         return False
-    client.send_message(
-        chat_id, _truncate(text),
-        reply_markup=reply_markup or _default_keyboard(command_name),
-    )
+    response_text = _truncate(text)
+    response_markup = reply_markup or _default_keyboard(command_name)
+    if callback and callback_message_id is not None and hasattr(client, "edit_message_text"):
+        try:
+            client.edit_message_text(
+                chat_id,
+                callback_message_id,
+                response_text,
+                reply_markup=response_markup,
+            )
+            return True
+        except RuntimeError:
+            if hasattr(client, "delete_message"):
+                try:
+                    client.delete_message(chat_id, callback_message_id)
+                except RuntimeError:
+                    pass
+    client.send_message(chat_id, response_text, reply_markup=response_markup)
     return True
 
 
