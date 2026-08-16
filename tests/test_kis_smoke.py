@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -101,6 +103,106 @@ def test_cache_miss_and_refresh_issue_both_credentials(tmp_path: Path):
     assert refreshed.cache_hit is False
     assert len(refresh_session.posts) == 2
     assert json.loads(cache.read_text(encoding="utf-8"))["expires_at"]
+
+
+def test_concurrent_cache_miss_issues_credentials_once(tmp_path: Path):
+    cache = tmp_path / "kis_token_demo.json"
+    calls = 0
+    calls_lock = threading.Lock()
+
+    class SlowSharedSession(FakeSession):
+        def post(self, url, **kwargs):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.05)
+            return super().post(url, **kwargs)
+
+    clients = [
+        KisAuthClient("demo", "app-key", "app-secret", session=SlowSharedSession())
+        for _ in range(2)
+    ]
+    start = threading.Barrier(2)
+    results = []
+
+    def authenticate(client):
+        start.wait()
+        results.append(client.authenticate_read_only(cache))
+
+    threads = [threading.Thread(target=authenticate, args=(client,)) for client in clients]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert calls == 2
+    assert {result.access_token for result in results} == {"access-token-value"}
+    assert {result.approval_key for result in results} == {"approval-key-value"}
+    assert sorted(result.cache_hit for result in results) == [False, True]
+
+
+def test_approval_failure_preserves_access_token_for_retry(tmp_path: Path):
+    cache = tmp_path / "kis_token_demo.json"
+
+    class ApprovalFailureSession(FakeSession):
+        def post(self, url, **kwargs):
+            if url.endswith("/Approval"):
+                return FakeResponse(
+                    {"rt_cd": "-1", "msg_cd": "WS_ERROR"}, status_code=503
+                )
+            return super().post(url, **kwargs)
+
+    with pytest.raises(KisHttpError):
+        KisAuthClient(
+            "demo", "app-key", "app-secret", session=ApprovalFailureSession()
+        ).authenticate_read_only(cache)
+
+    partial = json.loads(cache.read_text(encoding="utf-8"))
+    assert partial["access_token"] == "access-token-value"
+    assert "approval_key" not in partial
+
+    retry_session = FakeSession()
+    result = KisAuthClient(
+        "demo", "app-key", "app-secret", session=retry_session
+    ).authenticate_read_only(cache)
+
+    assert result.access_token == "access-token-value"
+    assert result.approval_key == "approval-key-value"
+    assert len(retry_session.posts) == 1
+    assert retry_session.posts[0][0].endswith("/Approval")
+
+
+def test_access_token_rate_limit_is_cached_without_repeating_http_call(tmp_path: Path):
+    cache = tmp_path / "kis_token_demo.json"
+
+    class RateLimitedSession:
+        def __init__(self):
+            self.posts = 0
+
+        def post(self, url, **kwargs):
+            self.posts += 1
+            return FakeResponse(
+                {
+                    "rt_cd": "-1",
+                    "msg_cd": "EGW_RATE_LIMIT",
+                    "error_description": "one access token per minute",
+                },
+                status_code=403,
+            )
+
+    session = RateLimitedSession()
+    client = KisAuthClient("demo", "app-key", "app-secret", session=session)
+
+    with pytest.raises(KisHttpError, match="HTTP 403"):
+        client.authenticate_read_only(cache)
+    with pytest.raises(KisHttpError, match="retry_after"):
+        client.authenticate_read_only(cache)
+
+    assert session.posts == 1
+    cached = json.loads(cache.read_text(encoding="utf-8"))
+    assert cached["last_error_status"] == 403
+    assert "access_token" not in cached
 
 
 def test_http_403_body_becomes_safe_error_without_secrets():

@@ -139,7 +139,8 @@ def test_legacy_mode_and_live_gate_inputs_are_ignored(tmp_path):
 
 
 @pytest.mark.parametrize("enabled", [None, "false"])
-def test_broker_orders_are_blocked_without_single_live_gate(monkeypatch, enabled):
+def test_broker_orders_are_blocked_without_single_live_gate(monkeypatch, tmp_path, enabled):
+    monkeypatch.chdir(tmp_path)
     if enabled is None:
         monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
     else:

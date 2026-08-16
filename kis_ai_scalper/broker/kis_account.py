@@ -259,7 +259,10 @@ class KisAccountClient:
             },
             timeout=self.timeout,
         )
-        payload = _response_payload(response, (self.app_key, self.app_secret, self.access_token))
+        payload = _response_payload(
+            response,
+            (self.app_key, self.app_secret, self.access_token, self.account_no),
+        )
         positions = tuple(
             position
             for row in _as_rows(payload.get("output1"))

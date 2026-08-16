@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kis_ai_scalper.broker.kis_auth import KisHttpError
 from kis_ai_scalper.broker.kis_order import KisOrderSide
 from kis_ai_scalper.broker.kis_order_status import (
     KisCancelResult,
@@ -195,6 +196,72 @@ def test_exception_blocks_entries_and_records_sanitized_error(tmp_path, monkeypa
         assert database.get_runtime_metadata("block_new_entries") == "true"
         assert database.get_runtime_metadata(supervisor.LAST_ERROR_KEY) == "RuntimeError"
         assert "super-secret" not in (database.get_runtime_metadata(supervisor.STATUS_KEY) or "")
+
+
+@pytest.mark.parametrize(
+    ("status_code", "refresh_expected"),
+    [(403, False), (401, True)],
+)
+def test_auth_refresh_only_requested_for_401(tmp_path, monkeypatch, status_code, refresh_expected):
+    path, _ = make_db(tmp_path)
+    error = KisHttpError(
+        status_code,
+        {"rt_cd": "-1", "msg_cd": "EGW00123", "msg1": "auth failure"},
+    )
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: (_ for _ in ()).throw(error))
+
+    state = supervisor.SupervisorState()
+    result = supervisor.one_iteration(
+        "config/settings.yaml",
+        path,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+        state=state,
+    )
+
+    assert result.status == "error"
+    assert result.auth_refresh_requested is refresh_expected
+    assert state.force_refresh is refresh_expected
+
+
+def test_kis_http_error_exposes_safe_metadata_but_runtime_error_does_not(tmp_path, monkeypatch):
+    path, _ = make_db(tmp_path)
+    kis_error = KisHttpError(
+        403,
+        {
+            "rt_cd": "-1",
+            "msg_cd": "EGW00123",
+            "msg1": "forbidden request",
+            "error_description": "rate limited",
+        },
+    )
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: (_ for _ in ()).throw(kis_error))
+
+    result = supervisor.one_iteration(
+        "config/settings.yaml",
+        path,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+    )
+    assert result.error == (
+        "KisHttpError: KIS HTTP 403 (rt_cd=-1 msg_cd=EGW00123 "
+        "msg1=forbidden request error_description=rate limited)"
+    )
+
+    secret = "token=super-secret account=12345678"
+    monkeypatch.setattr(
+        supervisor,
+        "reconcile_broker_state",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    runtime_result = supervisor.one_iteration(
+        "config/settings.yaml",
+        path,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+    )
+    assert runtime_result.error == "RuntimeError"
+    assert secret not in runtime_result.error
 
 
 def test_retry_backoff_is_capped_and_interruptible(monkeypatch):

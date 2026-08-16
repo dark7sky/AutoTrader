@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kis_ai_scalper.broker.kis_account import KisAccountClient
-from kis_ai_scalper.broker.kis_auth import KisAuthClient
+from kis_ai_scalper.broker.kis_auth import KisAuthClient, KisHttpError
 from kis_ai_scalper.broker.kis_endpoints import KisEnvironment
 from kis_ai_scalper.broker.kis_order import KisOrderSide
 from kis_ai_scalper.broker.kis_order_status import (
@@ -201,23 +201,27 @@ def _call_factory(
 
 
 def _sanitized_error(exc: BaseException) -> str:
+    if isinstance(exc, KisHttpError):
+        return f"KisHttpError: {exc}"
     return type(exc).__name__
 
 
 def _looks_like_auth_error(value: Any) -> bool:
+    if isinstance(value, KisHttpError):
+        details = " ".join(str(item) for item in value.details.values()).lower()
+        return value.status_code == 401 or any(
+            marker in details
+            for marker in ("token expired", "expired token", "만료")
+        )
     text = str(value).lower()
     return any(
         token in text
         for token in (
             "401",
-            "403",
             "unauthorized",
-            "forbidden",
-            "kishttperror",
-            "token",
-            "auth",
-            "접근",
-            "인증",
+            "token expired",
+            "expired token",
+            "만료",
         )
     )
 
@@ -507,7 +511,14 @@ def one_iteration(
                 notifier,
                 state,
                 status,
-                f"order-supervisor: {status} environment={environment.value} paused={str(control.paused).lower()}",
+                (
+                    f"order-supervisor: {status} environment={environment.value} "
+                    f"paused={str(control.paused).lower()}"
+                    + (
+                        f" reason={reconciliation.reasons[0]}"
+                        if reconciliation.reasons else ""
+                    )
+                ),
             )
             return OrderSupervisorResult(
                 status,

@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from kis_ai_scalper.broker.kis_account import KisAccountClient
+from kis_ai_scalper.broker.kis_auth import KisHttpError
 from kis_ai_scalper.broker.kis_order_status import (
     KisOrderStatus,
     KisOrderStatusClient,
@@ -63,7 +64,7 @@ def reconcile_broker_state(
     try:
         broker_orders = tuple(order_status_client.get_today_orders())
     except Exception as exc:
-        reasons.append(f"order_status_unavailable:{type(exc).__name__}")
+        reasons.append(f"order_status_unavailable:{_exception_code(exc)}")
         return _finish(database, now, updated_orders, new_fills, materialized_fills, reasons)
 
     by_broker_id = {order.order_number: order for order in broker_orders if order.order_number}
@@ -167,7 +168,7 @@ def reconcile_broker_state(
     try:
         account = account_client.get_snapshot()
     except Exception as exc:
-        reasons.append(f"account_snapshot_unavailable:{type(exc).__name__}")
+        reasons.append(f"account_snapshot_unavailable:{_exception_code(exc)}")
         return _finish(database, now, updated_orders, new_fills, materialized_fills, reasons)
 
     local_positions = _local_position_quantities(database)
@@ -198,6 +199,17 @@ def _same_order(local: Any, broker: KisOrderStatusRecord) -> bool:
     local_side = str(local["side"]).upper()
     broker_side = broker.side.name if broker.side is not None else ""
     return str(local["symbol"]) == broker.symbol and local_side == broker_side
+
+
+def _exception_code(exc: BaseException) -> str:
+    if not isinstance(exc, KisHttpError):
+        return type(exc).__name__
+    parts = ["KisHttpError", f"http_{exc.status_code}"]
+    for key in ("rt_cd", "msg_cd"):
+        value = str(exc.details.get(key, "")).strip()
+        if value and all(character.isalnum() or character in {"-", "_"} for character in value):
+            parts.append(f"{key}_{value}")
+    return ":".join(parts)
 
 
 def _local_status_for_broker(status: KisOrderStatus) -> str | None:

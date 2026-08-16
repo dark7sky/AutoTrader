@@ -306,7 +306,10 @@ class KisOrderStatusClient:
             params=params,
             timeout=self.timeout,
         )
-        payload = _payload(response, (self.app_key, self.app_secret, self.access_token))
+        payload = _payload(
+            response,
+            (self.app_key, self.app_secret, self.access_token, self.account_no),
+        )
         rows = payload.get("output1") or []
         if not isinstance(rows, list):
             rows = []
@@ -379,7 +382,10 @@ class KisOrderStatusClient:
             },
             timeout=self.timeout,
         )
-        payload = _payload(response, (self.app_key, self.app_secret, self.access_token))
+        payload = _payload(
+            response,
+            (self.app_key, self.app_secret, self.access_token, self.account_no),
+        )
         rows = payload.get("output") or payload.get("output1") or []
         if not isinstance(rows, list):
             rows = []
@@ -433,7 +439,10 @@ class KisOrderStatusClient:
             json=body,
             timeout=self.timeout,
         )
-        payload = _payload(response, (self.app_key, self.app_secret, self.access_token))
+        payload = _payload(
+            response,
+            (self.app_key, self.app_secret, self.access_token, self.account_no),
+        )
         output = payload.get("output") or {}
         if not isinstance(output, dict):
             output = {}
