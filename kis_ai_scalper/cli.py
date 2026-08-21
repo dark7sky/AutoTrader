@@ -394,6 +394,10 @@ def telegram_poll(db_path: str, bot_token_env: str, allowed_chat_id_env: str,
 
 SERVICE_LEASE_NAME = "trading-service"
 AUTO_TRADE_LAST_CYCLE_KEY = "auto_trade:last_cycle"
+TELEGRAM_NOTIFICATION_HISTORY_KEY = "telegram.notification_history"
+TELEGRAM_NOTIFICATION_MESSAGE_ID_KEY = "telegram.notification_message_id"
+TELEGRAM_NOTIFICATION_HISTORY_LIMIT = 5
+TELEGRAM_NOTIFICATION_ENTRY_LIMIT = 650
 SERVICE_LEASE_TTL_SECONDS = 180
 RETENTION_LAST_DAY_KEY = "market_retention:last_cleanup_day"
 LIVE_REPORT_KEY = "live_report_snapshot"
@@ -619,7 +623,7 @@ def service_loop(
     if cycle_interval_seconds < 1:
         raise ValueError("cycle_interval_seconds must be positive")
     owner_id = uuid4().hex
-    notifier = _telegram_notifier_from_env()
+    notifier = _telegram_notifier_from_env(db_path)
     telegram_poll_stop = threading.Event()
     telegram_poll_failed = threading.Event()
     telegram_poll_thread: threading.Thread | None = None
@@ -673,6 +677,7 @@ def service_loop(
                         "timeout_seconds": telegram_timeout_seconds,
                         "stop_event": telegram_poll_stop,
                         "failed_event": telegram_poll_failed,
+                        "notifier": notifier,
                     },
                     name="telegram-poll",
                     daemon=True,
@@ -690,7 +695,9 @@ def service_loop(
                         max_retries=int(_env_number("OPENAI_MAX_RETRIES", 1, integer=True, minimum=0)),
                     )
                 except Exception as exc:
-                    _notify_operator_if_possible(f"AI setup warning: {type(exc).__name__}")
+                    _notify_operator_if_possible(
+                        f"AI setup warning: {type(exc).__name__}", notifier=notifier,
+                    )
 
             print("service-loop: started")
             last_alert = ""
@@ -727,6 +734,7 @@ def service_loop(
                             now=now,
                             fingerprint_key=PREFLIGHT_ALERT_FINGERPRINT_KEY,
                             sent_at_key=PREFLIGHT_ALERT_AT_KEY,
+                            notifier=notifier,
                         )
                         _sleep_remaining(started, cycle_interval_seconds)
                         continue
@@ -807,14 +815,19 @@ def service_loop(
                         config_path, env, db_path, symbols, refresh_token,
                         manage_orders=False,
                     )
-                    _notify_order_management_alert(lease_database, state.order_management, now=now)
+                    _notify_order_management_alert(
+                        lease_database, state.order_management, now=now, notifier=notifier,
+                    )
                     if state.reconciliation.reasons:
                         message = "broker reconciliation\n" + "\n".join(
                             f"- {reason}" for reason in state.reconciliation.reasons
                         )
                         if message != last_alert or time.monotonic() - last_alert_at > 300:
                             last_alert, last_alert_at = message, time.monotonic()
-                            _notify_operator_if_possible(message + "\nNew entries are blocked; runtime is not auto-paused.")
+                            _notify_operator_if_possible(
+                                message + "\nNew entries are blocked; runtime is not auto-paused.",
+                                notifier=notifier,
+                            )
                     cycle_control = control
                     if telegram_poll_failed.is_set() or state.portfolio.fail_closed:
                         cycle_control = replace(control, paused=True, reason="entry_gate_blocked")
@@ -835,7 +848,7 @@ def service_loop(
                     message = f"service cycle warning: {type(exc).__name__}"
                     print(message, file=sys.stderr)
                     lease_database.set_runtime_metadata("service:last_error", message, updated_at=kst_now())
-                    _notify_operator_if_possible(message)
+                    _notify_operator_if_possible(message, notifier=notifier)
                 _sleep_remaining(started, cycle_interval_seconds)
         finally:
             telegram_poll_stop.set()
@@ -883,20 +896,106 @@ def _sleep_remaining(started: float, interval_seconds: int) -> None:
 
 
 class _TelegramNotifier:
-    def __init__(self, token: str, chat_id: str) -> None:
+    def __init__(self, token: str, chat_id: str, db_path: str | None = None) -> None:
         from kis_ai_scalper.ops.telegram import TelegramClient
 
         self.client = TelegramClient(token)
         self.chat_id = chat_id
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._history: list[dict[str, str]] = []
+        self._message_id: int | None = None
+        self._state_loaded = False
+
+    def _load_state(self) -> None:
+        if self._state_loaded:
+            return
+        self._state_loaded = True
+        if self.db_path is None:
+            return
+        with connect_database(self.db_path) as database:
+            database.init_schema()
+            raw_history = database.get_runtime_metadata(TELEGRAM_NOTIFICATION_HISTORY_KEY)
+            raw_message_id = database.get_runtime_metadata(TELEGRAM_NOTIFICATION_MESSAGE_ID_KEY)
+        try:
+            parsed = json.loads(raw_history or "[]")
+        except (TypeError, ValueError):
+            parsed = []
+        if isinstance(parsed, list):
+            for item in parsed[-TELEGRAM_NOTIFICATION_HISTORY_LIMIT:]:
+                if not isinstance(item, dict):
+                    continue
+                timestamp = str(item.get("timestamp") or "").strip()[:32]
+                text = str(item.get("text") or "").strip()[:TELEGRAM_NOTIFICATION_ENTRY_LIMIT]
+                if timestamp and text:
+                    self._history.append({"timestamp": timestamp, "text": text})
+        try:
+            message_id = int(raw_message_id or "")
+        except (TypeError, ValueError):
+            message_id = 0
+        self._message_id = message_id if message_id > 0 else None
+
+    def _persist_state(self, now: datetime) -> None:
+        if self.db_path is None:
+            return
+        with connect_database(self.db_path) as database:
+            database.init_schema()
+            database.set_runtime_metadata(
+                TELEGRAM_NOTIFICATION_HISTORY_KEY,
+                json.dumps(self._history, ensure_ascii=True, separators=(",", ":")),
+                updated_at=now,
+            )
+            database.set_runtime_metadata(
+                TELEGRAM_NOTIFICATION_MESSAGE_ID_KEY,
+                str(self._message_id or ""),
+                updated_at=now,
+            )
+
+    def _render_history(self) -> str:
+        lines = [f"최근 운영 알림 ({len(self._history)}/{TELEGRAM_NOTIFICATION_HISTORY_LIMIT})"]
+        for item in self._history:
+            lines.append(f"\n[{item['timestamp']}]\n{item['text']}")
+        return "\n".join(lines)
 
     def send(self, text: str) -> None:
         from kis_ai_scalper.ops.telegram import MAIN_MENU_KEYBOARD
 
-        self.client.send_message(
-            self.chat_id,
-            text,
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        now = kst_now()
+        entry = {
+            "timestamp": now.strftime("%m-%d %H:%M:%S"),
+            "text": str(text).strip()[:TELEGRAM_NOTIFICATION_ENTRY_LIMIT],
+        }
+        with self._lock:
+            self._load_state()
+            self._history.append(entry)
+            self._history = self._history[-TELEGRAM_NOTIFICATION_HISTORY_LIMIT:]
+            rendered = self._render_history()
+            if self._message_id is not None:
+                try:
+                    self.client.edit_message_text(
+                        self.chat_id,
+                        self._message_id,
+                        rendered,
+                        reply_markup=MAIN_MENU_KEYBOARD,
+                    )
+                    self._persist_state(now)
+                    return
+                except RuntimeError:
+                    try:
+                        self.client.delete_message(self.chat_id, self._message_id)
+                    except RuntimeError:
+                        pass
+                    self._message_id = None
+            result = self.client.send_message(
+                self.chat_id,
+                rendered,
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+            if isinstance(result, dict):
+                message = result.get("result")
+                if isinstance(message, dict) and isinstance(message.get("message_id"), int):
+                    self._message_id = message["message_id"]
+            self._persist_state(now)
 
     def install_menu(self) -> None:
         from kis_ai_scalper.ops.telegram import BOT_COMMANDS
@@ -906,6 +1005,18 @@ class _TelegramNotifier:
 
     def send_menu(self, text: str) -> None:
         self.send(text)
+
+    def send_approval(self, request_id: str, text: str) -> None:
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "승인", "callback_data": f"approval:approve:{request_id}"},
+                    {"text": "거절", "callback_data": f"approval:reject:{request_id}"},
+                ],
+                [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+            ]
+        }
+        self.client.send_message(self.chat_id, text, reply_markup=reply_markup)
 
 
 def _telegram_poll_worker(
@@ -917,6 +1028,7 @@ def _telegram_poll_worker(
     timeout_seconds: int,
     stop_event: threading.Event,
     failed_event: threading.Event,
+    notifier: _TelegramNotifier | None = None,
 ) -> None:
     """Poll Telegram independently so operator controls are responsive during collection."""
 
@@ -947,6 +1059,7 @@ def _telegram_poll_worker(
                         now=kst_now(),
                         fingerprint_key="service:telegram_poll_alert:fingerprint",
                         sent_at_key="service:telegram_poll_alert:at",
+                        notifier=notifier,
                     )
             except Exception as metadata_exc:
                 print(
@@ -960,20 +1073,20 @@ def _env_live_trading_enabled() -> bool:
     return env_value("LIVE_TRADING_ENABLED").lower() == "true"
 
 
-def _telegram_notifier_from_env() -> _TelegramNotifier | None:
+def _telegram_notifier_from_env(db_path: str | None = None) -> _TelegramNotifier | None:
     token = optional_env_value("TELEGRAM_BOT_TOKEN")
     chat_id = optional_env_value("TELEGRAM_ALLOWED_CHAT_ID")
     if not token or not chat_id:
         return None
-    return _TelegramNotifier(token, chat_id)
+    return _TelegramNotifier(token, chat_id, db_path)
 
 
-def _notify_operator_if_possible(text: str) -> bool:
-    notifier = _telegram_notifier_from_env()
-    if notifier is None:
+def _notify_operator_if_possible(text: str, *, notifier: _TelegramNotifier | None = None) -> bool:
+    target = notifier or _telegram_notifier_from_env()
+    if target is None:
         return False
     try:
-        notifier.send(text)
+        target.send(text)
     except Exception as exc:
         print(f"telegram notification warning: {type(exc).__name__}", file=sys.stderr)
         return False
@@ -987,6 +1100,7 @@ def _send_throttled_service_alert(
     now: datetime,
     fingerprint_key: str,
     sent_at_key: str,
+    notifier: _TelegramNotifier | None = None,
 ) -> bool:
     """Send one service alert per message every 15 minutes, across restarts."""
 
@@ -1004,7 +1118,12 @@ def _send_throttled_service_alert(
         except ValueError:
             pass
 
-    if not _notify_operator_if_possible(message):
+    delivered = (
+        _notify_operator_if_possible(message)
+        if notifier is None
+        else _notify_operator_if_possible(message, notifier=notifier)
+    )
+    if not delivered:
         return False
     database.set_runtime_metadata(fingerprint_key, fingerprint, updated_at=now)
     database.set_runtime_metadata(sent_at_key, now.isoformat(), updated_at=now)
@@ -1016,6 +1135,7 @@ def _notify_order_management_alert(
     report: OrderManagementReport,
     *,
     now: datetime,
+    notifier: _TelegramNotifier | None = None,
 ) -> bool:
     """Alert on order actions without exposing order identifiers or quantities."""
 
@@ -1043,6 +1163,7 @@ def _notify_order_management_alert(
         now=now,
         fingerprint_key=ORDER_MANAGEMENT_ALERT_FINGERPRINT_KEY,
         sent_at_key=ORDER_MANAGEMENT_ALERT_AT_KEY,
+        notifier=notifier,
     )
 
 

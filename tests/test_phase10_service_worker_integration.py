@@ -48,7 +48,7 @@ def seed_acknowledged_buy(path: Path) -> None:
 
 
 def _patch_service_dependencies(monkeypatch, *, preflight_errors, worker_calls):
-    monkeypatch.setattr(cli, "_telegram_notifier_from_env", lambda: None)
+    monkeypatch.setattr(cli, "_telegram_notifier_from_env", lambda *_args: None)
     monkeypatch.setattr(cli, "optional_env_value", lambda name: None)
     monkeypatch.setattr(cli, "_runtime_preflight", lambda *args: list(preflight_errors))
     monkeypatch.setattr(cli, "_sleep_remaining", lambda *args: (_ for _ in ()).throw(KeyboardInterrupt))

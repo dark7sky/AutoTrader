@@ -144,6 +144,8 @@ docker compose --profile smoke run --rm smoke-fill-notice
 
 Telegram에서는 `/start` 또는 `/menu`를 누르면 메인 메뉴가 표시됩니다. `모의매매 준비 점검`에서 Resume blocker를 확인하고, 상태·거래·제어·환경·AI 하위 메뉴의 버튼으로 주요 기능에 접근합니다. 버튼 이동은 현재 메뉴 메시지를 교체하므로 메시지가 쌓이지 않습니다. 시장 휴장은 Resume blocker가 아니며, 기존 명령과 `control:`/`approval:` 콜백도 계속 호환됩니다.
 
+일반 서비스·연결·supervisor 알림은 하나의 `최근 운영 알림` 메시지를 편집하며 최신 5건만 표시합니다. 기록과 메시지 ID는 runtime DB에 보존되어 컨테이너 재시작 후에도 이어집니다. 승인 요청은 승인·거절 버튼을 보존하기 위해 독립 메시지로 전송됩니다.
+
 주요 명령:
 
 ```text

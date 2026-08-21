@@ -35,7 +35,7 @@ def test_service_loop_pauses_even_when_legacy_argument_is_false(tmp_path, monkey
     def stop_preflight(*_args):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli, "_telegram_notifier_from_env", lambda: None)
+    monkeypatch.setattr(cli, "_telegram_notifier_from_env", lambda *_args: None)
     monkeypatch.setattr(cli, "_runtime_preflight", stop_preflight)
 
     with pytest.raises(KeyboardInterrupt):
