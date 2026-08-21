@@ -250,6 +250,26 @@ def test_readiness_reports_blockers_and_market_closed_is_not_one(tmp_path, monke
     assert "blockers: none" in text
 
 
+def test_status_and_readiness_show_operator_review_reasons(tmp_path, monkeypatch):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    _ready_demo_env(monkeypatch)
+    monkeypatch.setattr(telegram_module, "is_regular_market_open", lambda _: False)
+    _ready_demo_db(path)
+    with connect_database(path) as database:
+        database.set_runtime_metadata("operator_review", "true")
+        database.set_runtime_metadata(
+            "order-supervisor.status",
+            '{"status":"reconciled_operator_review","reasons":["reconciliation:position_mismatch"]}',
+        )
+
+    update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
+    assert handle_update(update("/status"), path, fake, "42")
+    assert "operator_review_reasons: reconciliation:position_mismatch" in fake.sent[-1][1]
+    assert handle_update(update("/readiness"), path, fake, "42")
+    assert "operator_review=true (reconciliation:position_mismatch)" in fake.sent[-1][1]
+
+
 def test_watchlist_commands_validate_and_reactivate_symbols(tmp_path):
     path = str(tmp_path / "control.sqlite3")
     fake = FakeTelegram()

@@ -42,6 +42,7 @@ LAST_ERROR_KEY = f"{SUPERVISOR_COMPONENT}.last_error"
 CANCEL_REQUEST_KEY = "operator.cancel_open_buys_requested"
 CANCEL_STATUS_KEY = "operator.cancel_open_buys_status"
 DEFAULT_NOTIFY_THROTTLE_SECONDS = 300.0
+RECOVERY_HEALTHY_ITERATIONS = 3
 
 
 ClientFactory = Callable[..., Any]
@@ -56,6 +57,7 @@ class SupervisorState:
     force_refresh: bool = False
     last_notification_state: str | None = None
     last_notification_at: float = 0.0
+    healthy_iterations: int = 0
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,34 @@ class _CancelReport:
     errors: int = 0
     skipped: int = 0
     error_type: str | None = None
+
+
+def _safe_reason(value: Any) -> str:
+    """Keep reason codes useful while removing order/symbol identifiers."""
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    parts = text.split(":")
+    if text in {"TimeoutError", "KisHttpError", "ValueError", "TypeError"}:
+        return text
+    code = parts[0].strip().lower() or "unknown"
+    if len(parts) > 1:
+        detail = parts[-1].strip()
+        if detail in {"TimeoutError", "KisHttpError", "ValueError", "TypeError"}:
+            return f"{code}:{detail}"
+    return code
+
+
+def _status_reasons(reconciliation: Any, management: Any, cancel_report: _CancelReport) -> list[str]:
+    reasons: list[str] = []
+    reasons.extend(f"reconciliation:{_safe_reason(reason)}" for reason in getattr(reconciliation, "reasons", ()) or ())
+    for action in getattr(management, "actions", ()) or ():
+        reason = _safe_reason(getattr(action, "reason", ""))
+        if reason not in {"", "unknown"}:
+            reasons.append(f"stale_order:{reason}")
+    if cancel_report.error_type:
+        reasons.append(f"cancel:{_safe_reason(cancel_report.error_type)}")
+    return list(dict.fromkeys(reasons))
 
 
 def _now() -> datetime:
@@ -274,6 +304,7 @@ def _write_status(
     operator_review: bool = False,
     block_new_entries: bool = False,
     error: str | None = None,
+    reasons: list[str] | tuple[str, ...] = (),
     now: datetime,
 ) -> None:
     payload = {
@@ -282,6 +313,7 @@ def _write_status(
         "paused": paused,
         "operator_review": bool(operator_review),
         "block_new_entries": bool(block_new_entries),
+        "reasons": list(dict.fromkeys(reasons)),
         "updated_at": now.isoformat(),
     }
     database.set_runtime_metadata(STATUS_KEY, json.dumps(payload, sort_keys=True), updated_at=now)
@@ -301,6 +333,7 @@ def _mark_exception(database: Database, exc: BaseException, now: datetime) -> No
         operator_review=True,
         block_new_entries=True,
         error=error,
+        reasons=[f"error:{_safe_reason(error)}"],
         now=now,
     )
 
@@ -457,10 +490,11 @@ def one_iteration(
         with connect_database(db_path) as database:
             database.init_schema()
             if not _lease_is_valid(database, expected, current):
+                state.healthy_iterations = 0
                 _write_status(
                     database, status="lease_invalid", environment=None, paused=None,
                     operator_review=True, block_new_entries=True,
-                    error="invalid_service_lease", now=current,
+                    error="invalid_service_lease", reasons=["lease_invalid"], now=current,
                 )
                 _notify(notifier, state, "lease_invalid", "order-supervisor: service lease invalid")
                 return OrderSupervisorResult("lease_invalid", error="invalid_service_lease")
@@ -498,6 +532,7 @@ def one_iteration(
             review = bool(reconciliation.operator_review or management.operator_review or cancel_report.errors)
             blocked = bool(reconciliation.block_new_entries or management.block_new_entries or cancel_report.errors)
             status = "reconciled_operator_review" if review else "reconciled"
+            reasons = _status_reasons(reconciliation, management, cancel_report)
             _write_status(
                 database,
                 status=status,
@@ -505,21 +540,36 @@ def one_iteration(
                 paused=control.paused,
                 operator_review=review,
                 block_new_entries=blocked,
+                reasons=reasons,
                 now=current,
             )
-            _notify(
-                notifier,
-                state,
-                status,
-                (
-                    f"order-supervisor: {status} environment={environment.value} "
-                    f"paused={str(control.paused).lower()}"
-                    + (
-                        f" reason={reconciliation.reasons[0]}"
-                        if reconciliation.reasons else ""
+            if status == "reconciled_operator_review":
+                state.healthy_iterations = 0
+                reason_text = ", ".join(reasons) if reasons else "operator_review"
+                _notify(
+                    notifier,
+                    state,
+                    status,
+                    (
+                        f"order-supervisor: {status} environment={environment.value} "
+                        f"paused={str(control.paused).lower()} reasons={reason_text}"
+                    ),
+                )
+            else:
+                state.healthy_iterations += 1
+                if (
+                    state.healthy_iterations >= RECOVERY_HEALTHY_ITERATIONS
+                    and state.last_notification_state in {
+                        "reconciled_operator_review", "error", "lease_invalid"
+                    }
+                ):
+                    _notify(
+                        notifier,
+                        state,
+                        "recovered",
+                        f"order-supervisor: recovered environment={environment.value} "
+                        f"paused={str(control.paused).lower()}",
                     )
-                ),
-            )
             return OrderSupervisorResult(
                 status,
                 environment.value,
@@ -531,6 +581,7 @@ def one_iteration(
                 auth_refresh_requested=state.force_refresh,
             )
     except Exception as exc:
+        state.healthy_iterations = 0
         current = (now or _now()).astimezone(timezone.utc)
         try:
             with connect_database(db_path) as database:

@@ -79,6 +79,18 @@ def noop_management(*args, **kwargs):
     )()
 
 
+def management_with_action(reason="cancel_ambiguous"):
+    return type(
+        "Management",
+        (),
+        {
+            "operator_review": True,
+            "block_new_entries": True,
+            "actions": (type("Action", (), {"reason": reason})(),),
+        },
+    )()
+
+
 def broker_buy(*, status=KisOrderStatus.UNFILLED, remaining=10):
     return KisOrderStatusRecord(
         order_number="broker-1",
@@ -133,6 +145,114 @@ def test_paused_state_still_reconciles(tmp_path, monkeypatch):
     assert result.status == "reconciled"
     assert result.paused is True
     assert calls == ["reconcile"]
+
+
+def test_normal_reconciled_is_silent_on_start_and_repeated_passes(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: noop_reconciliation())
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
+    messages = []
+    state = supervisor.SupervisorState()
+    factory = lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient())
+
+    supervisor.one_iteration(
+        "config/settings.yaml", path, notifier=messages.append, state=state,
+        expected_owner_id="owner-1", client_factory=factory, now=now,
+    )
+    supervisor.one_iteration(
+        "config/settings.yaml", path, notifier=messages.append, state=state,
+        expected_owner_id="owner-1", client_factory=factory, now=now + timedelta(seconds=1),
+    )
+
+    assert messages == []
+    with connect_database(path) as database:
+        payload = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
+    assert payload["status"] == "reconciled"
+    assert payload["reasons"] == []
+
+
+def test_operator_review_is_throttled_and_recovery_notifies_once(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    reports = iter([
+        type("Reconciliation", (), {"operator_review": True, "block_new_entries": True,
+                                     "reasons": ("broker_order_missing:secret-order",)})(),
+        noop_reconciliation(),
+        noop_reconciliation(),
+        noop_reconciliation(),
+        noop_reconciliation(),
+    ])
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: next(reports))
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
+    messages = []
+    state = supervisor.SupervisorState()
+    factory = lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient())
+
+    for offset in range(5):
+        supervisor.one_iteration(
+            "config/settings.yaml", path, notifier=messages.append, state=state,
+            expected_owner_id="owner-1", client_factory=factory,
+            now=now + timedelta(seconds=offset),
+        )
+
+    assert len(messages) == 2
+    assert "reconciled_operator_review" in messages[0]
+    assert "secret-order" not in messages[0]
+    assert "recovered" in messages[1]
+
+
+def test_flapping_review_does_not_emit_recovery_or_repeat_warning(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    review = type(
+        "Reconciliation", (), {
+            "operator_review": True,
+            "block_new_entries": True,
+            "reasons": ("account_snapshot_unavailable:TimeoutError",),
+        },
+    )()
+    reports = iter([review, noop_reconciliation(), review, noop_reconciliation(), review])
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: next(reports))
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
+    messages = []
+    state = supervisor.SupervisorState()
+    factory = lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient())
+
+    for offset in range(5):
+        supervisor.one_iteration(
+            "config/settings.yaml", path, notifier=messages.append, state=state,
+            expected_owner_id="owner-1", client_factory=factory,
+            now=now + timedelta(seconds=offset),
+        )
+
+    assert len(messages) == 1
+    assert "reconciled_operator_review" in messages[0]
+
+
+def test_status_reasons_include_safe_reconciliation_stale_and_cancel_causes(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    seed_acknowledged_buy(path, now)
+    monkeypatch.setattr(
+        supervisor,
+        "reconcile_broker_state",
+        lambda *a, **k: type(
+            "Reconciliation", (), {"operator_review": True, "block_new_entries": True,
+                                     "reasons": ("position_mismatch:005930:local=1:broker=2",)}
+        )(),
+    )
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: management_with_action())
+    client = FakeOrderClient((broker_buy(),), cancel_error=TimeoutError("account=secret"))
+    supervisor.one_iteration(
+        "config/settings.yaml", path, expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (client, FakeAccountClient()), now=now,
+    )
+
+    with connect_database(path) as database:
+        payload = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
+    assert payload["reasons"] == [
+        "reconciliation:position_mismatch",
+        "stale_order:cancel_ambiguous",
+        "cancel:TimeoutError",
+    ]
+    assert all("005930" not in reason and "secret" not in reason for reason in payload["reasons"])
 
 
 def test_environment_change_rebuilds_clients(tmp_path, monkeypatch):

@@ -13,6 +13,7 @@
 - 주문 전 KRX `XKRX` 거래소 캘린더를 확인합니다. 캘린더가 준비되지 않으면 broker preflight가 fail-closed로 동작합니다.
 - 브로커에만 있는 기존 잔고를 local 포지션으로 자동 채택하지 않습니다. local에만 있거나 수량이 다른 포지션도 자동 청산하지 않습니다.
 - 잔고·주문·체결 불일치가 있으면 신규 진입을 차단하고 `operator_review`를 기록한 뒤 Telegram으로 문의합니다. 운영자가 원인을 확인하기 전에는 resume하지 않습니다.
+- `order-supervisor`의 정상 `reconciled` 결과는 반복 알림하지 않습니다. 이상 원인은 `/status`와 `/readiness`에 표시하고, 3회 연속 정상 대조 후 복구 알림을 한 번 보냅니다.
 - 미체결 BUY는 기본 60초, SELL은 기본 30초 후 취소를 요청합니다. 취소 HTTP 응답은 확정 체결 취소가 아니므로 KIS의 terminal 상태를 다시 확인할 때까지 `CANCEL_PENDING`으로 둡니다.
 - 고위험 AI BUY만 운영자 승인 대기로 보냅니다. 승인 요청은 2분 후 만료되며, 승인 전에는 주문하지 않습니다.
 - OpenAI 비용 조회 전용 키는 선택 사항입니다. 비용 키가 없으면 AI 판단과 별개로 비용 리포트만 `unavailable`이 될 수 있습니다.

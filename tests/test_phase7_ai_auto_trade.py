@@ -91,6 +91,7 @@ def test_watchlist_add_disable_and_list(tmp_path):
 def test_ai_buy_decision_requires_valid_price_ladder():
     decision = TradingAIDecision(
         symbol="005930",
+        generated_at=OPEN_MARKET_TIME,
         action=AIDecisionAction.BUY,
         confidence=0.8,
         entry_price=100_000,
@@ -104,6 +105,7 @@ def test_ai_buy_decision_requires_valid_price_ladder():
     with pytest.raises(ValidationError):
         TradingAIDecision(
             symbol="005930",
+            generated_at=OPEN_MARKET_TIME,
             action=AIDecisionAction.BUY,
             confidence=0.8,
             entry_price=100_000,
@@ -113,7 +115,7 @@ def test_ai_buy_decision_requires_valid_price_ladder():
         )
     with pytest.raises(ValidationError):
         TradingAIDecision(
-            symbol="005930", action=AIDecisionAction.HOLD,
+            symbol="005930", generated_at=OPEN_MARKET_TIME, action=AIDecisionAction.HOLD,
             confidence=1.2, rationale="bad confidence",
         )
 
@@ -121,6 +123,7 @@ def test_ai_buy_decision_requires_valid_price_ladder():
 def test_normal_ai_buy_ack_does_not_open_local_position(tmp_path):
     decision = TradingAIDecision(
         symbol="005930",
+        generated_at=OPEN_MARKET_TIME,
         action=AIDecisionAction.BUY,
         confidence=0.9,
         entry_price=100_000,
@@ -163,6 +166,7 @@ def test_normal_ai_buy_ack_does_not_open_local_position(tmp_path):
 def test_high_risk_ai_buy_requests_approval_without_order(tmp_path):
     decision = TradingAIDecision(
         symbol="005930",
+        generated_at=OPEN_MARKET_TIME,
         action=AIDecisionAction.BUY,
         confidence=0.85,
         entry_price=100_000,
@@ -218,7 +222,7 @@ def test_stop_loss_and_take_profit_sell_are_automatic(tmp_path):
             ["005930"],
             database=database,
             ai_client=FixedAI(TradingAIDecision(
-                symbol="005930", action=AIDecisionAction.HOLD,
+                symbol="005930", generated_at=OPEN_MARKET_TIME, action=AIDecisionAction.HOLD,
                 confidence=0.5, rationale="unused",
             )),
             submitter=submitter,
@@ -251,7 +255,7 @@ def test_stop_loss_and_take_profit_sell_are_automatic(tmp_path):
 
 def test_auto_trade_confirmation_required_blocks_before_ai_call(tmp_path):
     ai = FixedAI(TradingAIDecision(
-        symbol="005930", action=AIDecisionAction.HOLD,
+        symbol="005930", generated_at=OPEN_MARKET_TIME, action=AIDecisionAction.HOLD,
         confidence=0.5, rationale="unused",
     ))
     with connect_database(tmp_path / "auto.db") as database:
@@ -273,7 +277,7 @@ def test_auto_trade_confirmation_required_blocks_before_ai_call(tmp_path):
 
 def test_market_closed_blocks_before_ai_call(tmp_path):
     ai = FixedAI(TradingAIDecision(
-        symbol="005930", action=AIDecisionAction.HOLD,
+        symbol="005930", generated_at=OPEN_MARKET_TIME, action=AIDecisionAction.HOLD,
         confidence=0.5, rationale="unused",
     ))
     with connect_database(tmp_path / "auto.db") as database:
@@ -315,7 +319,7 @@ def test_previous_day_live_position_is_sold_before_new_entries(tmp_path):
             [],
             database=database,
             ai_client=FixedAI(TradingAIDecision(
-                symbol="005930", action=AIDecisionAction.HOLD,
+                symbol="005930", generated_at=OPEN_MARKET_TIME, action=AIDecisionAction.HOLD,
                 confidence=0.5, rationale="unused",
             )),
             submitter=submitter,

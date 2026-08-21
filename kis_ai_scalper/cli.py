@@ -393,6 +393,7 @@ def telegram_poll(db_path: str, bot_token_env: str, allowed_chat_id_env: str,
 
 
 SERVICE_LEASE_NAME = "trading-service"
+AUTO_TRADE_LAST_CYCLE_KEY = "auto_trade:last_cycle"
 SERVICE_LEASE_TTL_SECONDS = 180
 RETENTION_LAST_DAY_KEY = "market_retention:last_cleanup_day"
 LIVE_REPORT_KEY = "live_report_snapshot"
@@ -1550,6 +1551,31 @@ def auto_trade_cycle(
             exit_price_checker=lambda symbol: float(
                 post_ai_quote_client.get_current_price(symbol).price
             ),
+        )
+        database.set_runtime_metadata(
+            AUTO_TRADE_LAST_CYCLE_KEY,
+            json.dumps(
+                {
+                    "observed_at": cycle_time.isoformat(),
+                    "environment": env.value,
+                    "ai": ai,
+                    "results": [
+                        {
+                            "symbol": result.symbol,
+                            "action": result.action,
+                            "submitted": result.submitted,
+                            "blocked": result.blocked,
+                            "reason": result.reason,
+                            "quantity": result.quantity,
+                        }
+                        for result in report.results
+                    ],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            updated_at=cycle_time,
         )
     print("auto-trade-cycle: OK" if report.submitted_count else "auto-trade-cycle: NO_ORDERS")
     for result in report.results:

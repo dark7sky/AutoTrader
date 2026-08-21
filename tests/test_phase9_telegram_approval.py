@@ -7,6 +7,7 @@ from kis_ai_scalper.ai.decision import AIDecisionAction, AIRiskLevel, TradingAID
 from kis_ai_scalper.broker.kis_order import KisOrderResult, KisOrderSide, KisOrderType
 from kis_ai_scalper.broker.kis_order_status import KisOrderStatus, KisOrderStatusRecord
 from kis_ai_scalper.market.tick import MarketTick, MinuteBar
+import kis_ai_scalper.ops.telegram as telegram_module
 from kis_ai_scalper.ops.telegram import handle_update
 from kis_ai_scalper.pipeline.auto_trade import AutoTradeConfig, run_auto_trade_cycle
 from kis_ai_scalper.pipeline.broker_reconciliation import reconcile_broker_state
@@ -17,6 +18,11 @@ from kis_ai_scalper.storage.database import RuntimeControl
 
 NOW = datetime(2026, 8, 18, 9, 30)
 SYMBOL = "005930"
+
+
+@pytest.fixture(autouse=True)
+def freeze_telegram_clock(monkeypatch):
+    monkeypatch.setattr(telegram_module, "_utcnow", lambda: NOW)
 
 
 class FakeTelegram:
@@ -74,7 +80,8 @@ def seed_market(database):
 
 def high_risk_decision():
     return TradingAIDecision(
-        decision_id="decision-high-1", symbol=SYMBOL, action=AIDecisionAction.BUY,
+        decision_id="decision-high-1", symbol=SYMBOL, generated_at=NOW,
+        action=AIDecisionAction.BUY,
         confidence=0.9, entry_price=100_000, stop_loss_price=99_000,
         take_profit_price=102_000, max_holding_seconds=321,
         risk_level=AIRiskLevel.HIGH, requires_operator_approval=True,
@@ -248,7 +255,7 @@ def test_environment_switch_and_notifier_fail_closed_without_breaking_order(tmp_
         seed_market(database)
         report = run_auto_trade_cycle(
             [SYMBOL], database=database, ai_client=FixedAI(TradingAIDecision(
-                symbol=SYMBOL, action=AIDecisionAction.BUY, confidence=0.9,
+                symbol=SYMBOL, generated_at=NOW, action=AIDecisionAction.BUY, confidence=0.9,
                 entry_price=100_000, stop_loss_price=99_000, take_profit_price=102_000,
                 rationale="normal",
             )), submitter=Submitter(), runtime_control=control(),

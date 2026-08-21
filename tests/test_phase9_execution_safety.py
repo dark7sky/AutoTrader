@@ -24,6 +24,7 @@ def buy_decision(symbol=SYMBOL, *, decision_id="decision-1", entry=100_000):
     return TradingAIDecision(
         decision_id=decision_id,
         symbol=symbol,
+        generated_at=NOW,
         action=AIDecisionAction.BUY,
         confidence=0.9,
         entry_price=entry,

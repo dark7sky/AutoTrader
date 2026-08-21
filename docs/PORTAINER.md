@@ -190,6 +190,7 @@ KIS 체결통보 worker는 실전 `H0STCNI0`, 모의 `H0STCNI9`를 사용해 접
 - local에만 있거나 수량이 다른 position은 자동 청산하지 않습니다.
 - local 주문에 대응하지 않는 broker-only 주문·체결도 자동으로 local 거래로 만들지 않습니다.
 - 불일치가 있으면 `operator_review=true`, `block_new_entries=true`가 기록되고 신규 BUY가 차단됩니다.
+- 정상 `reconciled`는 Telegram에 반복 전송하지 않습니다. 이상 원인은 `/status`와 `/readiness`에서 확인하며, 3회 연속 정상 대조가 확인되면 복구 알림이 한 번 전송됩니다.
 - runtime을 자동으로 pause하지는 않으므로 운영자는 Telegram으로 알림을 확인하고 원인 확인 전 수동으로 `/pause`를 유지합니다.
 
 재시작 중 체결, 외부 수동 주문, 계좌 조회 실패, local DB 복원 시점을 확인한 뒤 KIS와 local ledger를 운영자가 대조합니다. 불일치를 자동 채택·자동 청산으로 덮어쓰지 않습니다.

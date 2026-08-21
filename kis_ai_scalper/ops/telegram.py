@@ -316,6 +316,7 @@ def _status_text(db_path: str) -> str:
     heartbeat_text, heartbeat_healthy = _heartbeat_status(heartbeat)
     fill_heartbeat_text, fill_healthy = _heartbeat_status(fill_heartbeat)
     supervisor_heartbeat_text, supervisor_healthy = _heartbeat_status(supervisor_heartbeat)
+    supervisor_reasons = _supervisor_reasons(supervisor_status)
     return (
         f"runtime: {state}\n"
         f"environment: {environment}\n"
@@ -325,6 +326,7 @@ def _status_text(db_path: str) -> str:
         f"trading_service: {heartbeat_text} healthy={heartbeat_healthy}\n"
         f"fill_notice: {_worker_status(fill_status)} heartbeat={fill_heartbeat_text} healthy={fill_healthy}\n"
         f"order_supervisor: {_worker_status(supervisor_status)} heartbeat={supervisor_heartbeat_text} healthy={supervisor_healthy}\n"
+        f"operator_review_reasons: {','.join(supervisor_reasons) or 'none'}\n"
         f"operator_review: {_safe_flag(operator_review)}\n"
         f"block_new_entries: {_safe_flag(block_entries)}\n"
         f"emergency_stop: {_safe_flag(emergency)}\n"
@@ -353,11 +355,13 @@ def _readiness(db_path: str) -> tuple[str, bool]:
             or database.get_runtime_metadata("emergency_stop")
         )
         cancel_pending = _safe_flag(database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY))
+        supervisor_status = database.get_runtime_metadata("order-supervisor.status")
         unresolved = database.connection.execute(
             "SELECT 1 FROM broker_orders WHERE status IN ('CANCEL_PENDING','UNKNOWN') LIMIT 1"
         ).fetchone() is not None
         trading_heartbeat = _heartbeat_status(database.get_heartbeat("trading-service"))[1]
         supervisor_heartbeat = _heartbeat_status(database.get_heartbeat("order-supervisor"))[1]
+    supervisor_reasons = _supervisor_reasons(supervisor_status)
 
     gate = (optional_env_value("LIVE_TRADING_ENABLED") or "").strip().lower() == "true"
     if not gate:
@@ -372,7 +376,8 @@ def _readiness(db_path: str) -> tuple[str, bool]:
     if not watchlist:
         blockers.append("관심종목 없음")
     if operator_review == "true":
-        blockers.append("operator_review=true")
+        detail = ",".join(supervisor_reasons)
+        blockers.append("operator_review=true" + (f" ({detail})" if detail else ""))
     if block_entries == "true":
         blockers.append("block_new_entries=true")
     if emergency == "true":
@@ -539,6 +544,23 @@ def _worker_status(value: str | None) -> str:
     except (TypeError, ValueError):
         pass
     return candidate if candidate.replace("_", "").replace("-", "").isalnum() else "unavailable"
+
+
+def _supervisor_reasons(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("reasons"), list):
+        return []
+    reasons = []
+    for item in payload["reasons"][:5]:
+        reason = str(item).replace("\n", " ").replace("\r", " ").strip()[:80]
+        if reason:
+            reasons.append(reason)
+    return reasons
 
 
 def _heartbeat_status(value: str | None) -> tuple[str, bool]:
