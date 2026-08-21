@@ -66,6 +66,20 @@ def private(text, update_id=None, chat_id=42, user_id=None):
     return update
 
 
+def prepare_ready_demo(path, monkeypatch):
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("AUTO_TRADE_AI", "rule")
+    monkeypatch.setenv("KIS_DEMO_APP_KEY", "demo-key")
+    monkeypatch.setenv("KIS_DEMO_APP_SECRET", "demo-secret")
+    monkeypatch.setenv("KIS_DEMO_ACCOUNT_NO", "12345678")
+    monkeypatch.setattr(telegram_module, "exchange_calendar_available", lambda: True)
+    with connect_database(path) as database:
+        database.init_schema()
+        database.add_watchlist_symbol("005930")
+        database.record_heartbeat("trading-service", heartbeat_at=telegram_module._utcnow())
+        database.record_heartbeat("order-supervisor", heartbeat_at=telegram_module._utcnow())
+
+
 def test_poll_persists_offset_in_update_id_order_and_consumes_unauthorized(tmp_path):
     path = str(tmp_path / "telegram.sqlite3")
     fake = FakeTelegram([
@@ -228,6 +242,31 @@ def test_telegram_client_registers_commands_and_chat_menu_button():
     assert [url.rsplit("/", 1)[1] for url, _ in calls] == ["setMyCommands", "setChatMenuButton"]
 
 
+def test_bot_commands_use_telegram_safe_underscore_names():
+    commands = {item["command"] for item in telegram_module.BOT_COMMANDS}
+    assert {"watchlist_add", "watchlist_remove"} <= commands
+    assert not any("-" in command for command in commands)
+
+
+def test_decisions_shows_last_cycle_before_recent_audits(tmp_path):
+    path = str(tmp_path / "telegram.sqlite3")
+    fake = FakeTelegram()
+    with connect_database(path) as database:
+        database.init_schema()
+        database.set_runtime_metadata("auto_trade:last_cycle", '{"observed_at":"now","environment":"demo","ai":"openai","results":[{"symbol":"005930","action":"HOLD","reason":"confidence low","submitted":false,"quantity":0}]}')
+        database.record_ai_decision(
+            decision_id="decision-1", symbol="005930", action="HOLD", confidence=0.4,
+            entry_price=None, take_profit_price=None, stop_loss_price=None,
+            risk_level="low", requires_operator_approval=False, rationale="short",
+        )
+    assert handle_update(private("/decisions"), path, fake, "42") is True
+    text = fake.sent[-1][1]
+    assert "environment=demo" in text
+    assert "action=HOLD" in text
+    assert "confidence low" in text
+    assert "AI audit:" in text
+
+
 def test_telegram_client_edit_message_text_uses_exact_api_payload():
     calls = []
 
@@ -303,7 +342,10 @@ def test_real_environment_requires_challenge_confirmation_and_one_time_arm(tmp_p
     fake = FakeTelegram()
     now = datetime(2026, 8, 16, 1, 0, tzinfo=timezone.utc)
     monkeypatch.setattr("kis_ai_scalper.ops.telegram._utcnow", lambda: now)
-
+    prepare_ready_demo(path, monkeypatch)
+    monkeypatch.setenv("KIS_REAL_APP_KEY", "real-key")
+    monkeypatch.setenv("KIS_REAL_APP_SECRET", "real-secret")
+    monkeypatch.setenv("KIS_REAL_ACCOUNT_NO", "87654321")
     assert handle_update(private("/env real"), path, fake, "42") is True
     challenge_text = fake.sent[-1][1]
     code = challenge_text.split("challenge: ", 1)[1].split("\n", 1)[0]
@@ -363,9 +405,10 @@ def test_real_callback_only_issues_challenge_and_uses_five_minutes(tmp_path, mon
         assert expires == start + timedelta(minutes=5)
 
 
-def test_emergency_stop_blocks_resume_until_cleared_while_paused(tmp_path):
+def test_emergency_stop_blocks_resume_until_cleared_while_paused(tmp_path, monkeypatch):
     path = str(tmp_path / "telegram.sqlite3")
     fake = FakeTelegram()
+    prepare_ready_demo(path, monkeypatch)
     assert handle_update(private("/emergency-stop"), path, fake, "42") is True
     with connect_database(path) as database:
         assert database.get_runtime_metadata(EMERGENCY_STOP_KEY) == "true"

@@ -129,16 +129,16 @@ Telegram에서 다음 순서로 확인합니다.
 2. smoke가 필요한 경우 Portainer에서 보조 프로파일을 별도로 실행하거나 호스트에서 read-only 명령을 실행합니다. 이 도구와 `trading-service`를 중복 운영하지 않습니다.
 3. KRX 거래일과 장중 시각을 확인합니다. 서비스는 `XKRX` 캘린더를 사용하며, 휴장일·장외에는 주문하지 않습니다. 캘린더를 사용할 수 없으면 broker preflight가 fail-closed입니다.
 4. 실제 demo 주문 접수 검증을 시작할 때 `LIVE_TRADING_ENABLED=true`로 바꾸고 Update the stack을 실행합니다.
-5. 재기동 후에도 paused인지 확인합니다. `/status`에서 `environment=demo`, `operator_review=false`, `block_new_entries=false`를 확인합니다.
-6. 잔고와 local position, active order가 일치하는지 확인하고 `/resume`을 입력합니다.
-7. 장중에는 `/status`, `/live-report`, `/orders`, `/fills`, `/approvals`를 관찰합니다.
+5. 재기동 후에도 paused인지 확인합니다. Telegram의 `모의매매 준비 점검` 버튼 또는 `/readiness`에서 주문 게이트, demo KIS 키·계좌, AI 키, 관심종목, worker heartbeat와 불일치 플래그를 확인합니다.
+6. `blockers: none`인지 확인하고 `/resume` 또는 `거래 재개` 버튼을 입력합니다. `krx_market_open=false`만으로는 Resume이 거부되지 않으며 장이 열릴 때까지 주문만 발생하지 않습니다.
+7. 장중에는 `최근 AI 판단` 또는 `/decisions`에서 cycle의 action/reason/submitted와 최근 AI audit을 확인하고, `/status`, `/live-report`, `/orders`, `/fills`, `/approvals`를 관찰합니다.
 8. 장 마감 후 보고서와 데이터를 백업합니다.
 
 조건이 맞지 않아 주문이 없는 것은 오류가 아닙니다. HOLD, risk reject, KRX 휴장, 신규진입 시간 종료, AI 비용 제한, 잔고 대조 실패는 각각 주문이 없거나 신규진입이 차단되는 정상적인 안전 경로일 수 있습니다.
 
 ## 5. Telegram 제어와 real challenge
 
-Telegram의 `/start` 또는 `/menu`에서 메인 메뉴를 열고 버튼으로 상태·거래·제어·환경·AI 메뉴에 접근할 수 있습니다. 각 하위 메뉴의 `메인 메뉴` 버튼으로 돌아올 수 있으며, 버튼 탐색 중에는 현재 메뉴 메시지가 교체되어 메시지가 누적되지 않습니다. 기존 명령과 승인 버튼도 계속 사용할 수 있습니다.
+Telegram의 `/start` 또는 `/menu`에서 메인 메뉴를 열고 버튼으로 준비 점검·상태·거래·제어·환경·AI 메뉴에 접근할 수 있습니다. 거래 메뉴에서 관심종목과 최근 AI 판단을 조회할 수 있습니다. 버튼 탐색 중에는 현재 메뉴 메시지가 교체되어 메시지가 누적되지 않습니다. 기존 명령과 승인 버튼도 계속 사용할 수 있습니다.
 
 지원하는 운영 명령은 다음과 같습니다.
 

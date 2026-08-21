@@ -15,6 +15,7 @@ from kis_ai_scalper.ops.control import set_environment, set_paused
 from kis_ai_scalper.ops.openai_usage import openai_cost_summary_from_env
 from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.storage import connect_database
+from kis_ai_scalper.market.schedule import exchange_calendar_available, is_regular_market_open
 
 
 REAL_CHALLENGE_KEY = "telegram.real_challenge"
@@ -105,12 +106,18 @@ class TelegramClient:
 
 BOT_COMMANDS = [
     {"command": "menu", "description": "메인 메뉴"},
+    {"command": "readiness", "description": "모의매매 준비 점검"},
+    {"command": "watchlist", "description": "관심종목 조회"},
+    {"command": "watchlist_add", "description": "관심종목 추가"},
+    {"command": "watchlist_remove", "description": "관심종목 제거"},
+    {"command": "decisions", "description": "최근 AI 판단"},
     {"command": "status", "description": "서비스 상태"},
     {"command": "control", "description": "운용 제어"},
 ]
 
 MAIN_MENU_KEYBOARD = {
     "inline_keyboard": [
+        [{"text": "모의매매 준비 점검", "callback_data": "control:readiness"}],
         [
             {"text": "상태·리포트", "callback_data": "menu:status"},
             {"text": "계좌·거래", "callback_data": "menu:trading"},
@@ -143,6 +150,10 @@ TRADING_MENU_KEYBOARD = {
         [
             {"text": "체결", "callback_data": "control:fills"},
             {"text": "승인 대기", "callback_data": "control:approvals"},
+        ],
+        [
+            {"text": "관심종목", "callback_data": "control:watchlist"},
+            {"text": "최근 AI 판단", "callback_data": "control:decisions"},
         ],
         [{"text": "메인 메뉴", "callback_data": "menu:main"}],
     ]
@@ -319,6 +330,153 @@ def _status_text(db_path: str) -> str:
         f"emergency_stop: {_safe_flag(emergency)}\n"
         f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}"
     )
+
+
+def _required_env_status(names: tuple[str, ...]) -> tuple[bool, str]:
+    missing = [name for name in names if optional_env_value(name) is None]
+    return not missing, ",".join(missing) if missing else "ok"
+
+
+def _readiness(db_path: str) -> tuple[str, bool]:
+    """Return a compact preflight view; a closed market is informational only."""
+    now = _utcnow()
+    blockers: list[str] = []
+    with connect_database(db_path) as database:
+        database.init_schema()
+        control = database.get_runtime_control()
+        environment = control.environment
+        watchlist = database.list_watchlist_symbols()
+        operator_review = _safe_flag(database.get_runtime_metadata("operator_review"))
+        block_entries = _safe_flag(database.get_runtime_metadata("block_new_entries"))
+        emergency = _safe_flag(
+            database.get_runtime_metadata(EMERGENCY_STOP_KEY)
+            or database.get_runtime_metadata("emergency_stop")
+        )
+        cancel_pending = _safe_flag(database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY))
+        unresolved = database.connection.execute(
+            "SELECT 1 FROM broker_orders WHERE status IN ('CANCEL_PENDING','UNKNOWN') LIMIT 1"
+        ).fetchone() is not None
+        trading_heartbeat = _heartbeat_status(database.get_heartbeat("trading-service"))[1]
+        supervisor_heartbeat = _heartbeat_status(database.get_heartbeat("order-supervisor"))[1]
+
+    gate = (optional_env_value("LIVE_TRADING_ENABLED") or "").strip().lower() == "true"
+    if not gate:
+        blockers.append("LIVE_TRADING_ENABLED=true 필요")
+    prefix = "KIS_DEMO" if environment == "demo" else "KIS_REAL"
+    kis_ok, kis_detail = _required_env_status((f"{prefix}_APP_KEY", f"{prefix}_APP_SECRET", f"{prefix}_ACCOUNT_NO"))
+    if not kis_ok:
+        blockers.append(f"{environment} KIS 누락: {kis_detail}")
+    ai = (optional_env_value("AUTO_TRADE_AI") or "openai").strip().lower()
+    if ai == "openai" and optional_env_value("OPENAI_API_KEY") is None:
+        blockers.append("OPENAI_API_KEY 필요(AUTO_TRADE_AI=openai)")
+    if not watchlist:
+        blockers.append("관심종목 없음")
+    if operator_review == "true":
+        blockers.append("operator_review=true")
+    if block_entries == "true":
+        blockers.append("block_new_entries=true")
+    if emergency == "true":
+        blockers.append("emergency_stop=true")
+    if cancel_pending == "true" or unresolved:
+        blockers.append("cancellation is still pending (미해결 주문/취소 대기)")
+    if not trading_heartbeat:
+        blockers.append("trading-service heartbeat 없음/오래됨")
+    if not supervisor_heartbeat:
+        blockers.append("order-supervisor heartbeat 없음/오래됨")
+    calendar_ok = exchange_calendar_available()
+    market_open = is_regular_market_open(now) if calendar_ok else False
+    if not calendar_ok:
+        blockers.append("KRX 캘린더 사용 불가")
+    lines = [
+        "모의매매 준비 점검",
+        f"environment={environment} paused={str(control.paused).lower()}",
+        f"resume_ready={str(not blockers).lower()}",
+        f"LIVE_TRADING_ENABLED={str(gate).lower()} KIS={str(kis_ok).lower()} AI={ai}",
+        f"watchlist={','.join(watchlist) or 'none'}",
+        f"operator_review={operator_review} block_new_entries={block_entries} emergency={emergency} cancel_pending={str(cancel_pending == 'true' or unresolved).lower()}",
+        f"worker_heartbeat=trading-service:{str(trading_heartbeat).lower()} order-supervisor:{str(supervisor_heartbeat).lower()}",
+        f"krx_market_open={str(market_open).lower()} (시장 휴장은 resume blocker 아님)",
+    ]
+    if blockers:
+        lines.append("blockers:")
+        lines.extend(f"- {item}" for item in blockers)
+    else:
+        lines.append("blockers: none")
+    return _truncate("\n".join(lines)), not blockers
+
+
+def _watchlist_text(db_path: str) -> str:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        symbols = database.list_watchlist_symbols()
+    return "관심종목\n" + ("\n".join(symbols) if symbols else "none")
+
+
+def _symbols_argument(command: tuple[str, str | int, str | int | None] | None) -> list[str]:
+    if not command or " " not in command[0]:
+        return []
+    raw = command[0].split(" ", 1)[1]
+    return [item for item in raw.replace(",", " ").replace(";", " ").split() if item]
+
+
+def _watchlist_change_text(db_path: str, command: tuple[str, str | int, str | int | None], *, add: bool) -> str:
+    symbols = _symbols_argument(command)
+    if not symbols:
+        return f"usage: {'/watchlist-add' if add else '/watchlist-remove'} <6자리코드들>"
+    invalid = [symbol for symbol in symbols if not symbol.isdigit() or len(symbol) != 6]
+    if invalid:
+        return "잘못된 종목코드: " + ",".join(invalid) + " (각각 6자리 숫자 필요)"
+    with connect_database(db_path) as database:
+        database.init_schema()
+        changed = []
+        for symbol in symbols:
+            if add:
+                database.add_watchlist_symbol(symbol, True)
+                changed.append(symbol)
+            elif database.set_watchlist_enabled(symbol, False):
+                changed.append(symbol)
+        current = database.list_watchlist_symbols()
+    action = "추가" if add else "제거"
+    return f"관심종목 {action}: {','.join(changed) or '변경 없음'}\n현재: {','.join(current) or 'none'}"
+
+
+def _decisions_text(db_path: str) -> str:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        cycle_raw = database.get_runtime_metadata("auto_trade:last_cycle")
+        rows = database.connection.execute(
+            "SELECT created_at,symbol,action,confidence,entry_price,take_profit_price,stop_loss_price,risk_level "
+            "FROM ai_decision_audits ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+    lines = ["최근 AI 판단"]
+    if cycle_raw:
+        try:
+            cycle = json.loads(cycle_raw)
+        except (TypeError, ValueError):
+            cycle = None
+        if isinstance(cycle, dict):
+            lines.append(f"cycle observed_at={cycle.get('observed_at', 'unknown')} environment={cycle.get('environment', 'unknown')} ai={cycle.get('ai', 'unknown')}")
+            results = cycle.get("results") or []
+            for result in results[:10]:
+                if isinstance(result, dict):
+                    lines.append(
+                        f"cycle {result.get('symbol','?')} action={result.get('action','?')} reason={str(result.get('reason','?'))[:80]} "
+                        f"submitted={str(result.get('submitted', False)).lower()} qty={result.get('quantity', 0)}"
+                    )
+    else:
+        lines.append("아직 장중 사이클 없음")
+    if rows:
+        lines.append("AI audit:")
+        for row in rows:
+            def price(value: Any) -> str:
+                return "none" if value is None else f"{value:g}"
+            lines.append(
+                f"{row['created_at']} {row['symbol']} action={row['action']} conf={row['confidence']:g} "
+                f"entry={price(row['entry_price'])} target={price(row['take_profit_price'])} stop={price(row['stop_loss_price'])} risk={row['risk_level']}"
+            )
+    else:
+        lines.append("AI audit: none")
+    return _truncate("\n".join(lines))
 
 
 def _positions_text(db_path: str) -> str:
@@ -522,6 +680,7 @@ def _command(update: dict[str, Any]) -> tuple[str, str | int, str | int | None] 
         argument = argument or "telegram_operator"
     return command + (" " + argument if argument and command in {
         "/pause", "/resume", "/env", "/environment", "/confirm-real", "/approve", "/reject",
+        "/watchlist-add", "/watchlist-remove", "/watchlist_add", "/watchlist_remove",
     } else ""), chat_id, user_id
 
 
@@ -550,6 +709,8 @@ def _callback(
 
 
 def _default_keyboard(command_name: str) -> dict[str, Any]:
+    if command_name in {"/readiness", "readiness", "/decisions", "decisions"}:
+        return MAIN_MENU_KEYBOARD if command_name in {"/readiness", "readiness"} else TRADING_MENU_KEYBOARD
     if command_name in {
         "/status", "status", "/report", "report", "/live-report", "live-report",
     }:
@@ -573,6 +734,11 @@ def _default_keyboard(command_name: str) -> dict[str, Any]:
         return ENVIRONMENT_MENU_KEYBOARD
     if command_name in {"/cost", "cost"}:
         return AI_MENU_KEYBOARD
+    if command_name in {
+        "/watchlist", "watchlist", "/watchlist-add", "watchlist-add", "/watchlist-remove", "watchlist-remove",
+        "/watchlist_add", "watchlist_add", "/watchlist_remove", "watchlist_remove",
+    }:
+        return TRADING_MENU_KEYBOARD
     return MAIN_MENU_KEYBOARD
 
 
@@ -621,6 +787,14 @@ def handle_update(
     elif command_name == "/menu:ai":
         text = "AI·비용 메뉴"
         reply_markup = AI_MENU_KEYBOARD
+    elif command_name == "/readiness":
+        text, _ = _readiness(db_path)
+    elif command_name == "/watchlist":
+        text = _watchlist_text(db_path)
+    elif command_name in {"/watchlist-add", "/watchlist-remove", "/watchlist_add", "/watchlist_remove"}:
+        text = _watchlist_change_text(db_path, command, add=command_name in {"/watchlist-add", "/watchlist_add"})
+    elif command_name == "/decisions":
+        text = _decisions_text(db_path)
     elif command_name == "/approval-callback":
         _, decision, request_id = action.split(":", 2)
         with connect_database(db_path) as database:
@@ -662,9 +836,13 @@ def handle_update(
         reason = "telegram_operator"
         if command and " " in command[0]:
             reason = command[0].split(" ", 1)[1]
+        readiness_text, resume_ready = _readiness(db_path)
         resume_safety_reason = _resume_safety_reason(db_path)
         if _emergency_stop_active(db_path):
             text = "resume rejected: emergency stop is active; use /clear-emergency while paused"
+        elif not resume_ready:
+            blockers = readiness_text.split("blockers:\n", 1)[-1].strip()
+            text = "resume rejected: readiness blockers\n" + blockers
         elif (_metadata(db_path, CANCEL_OPEN_BUYS_KEY) or "").strip().lower() in {"1", "true", "yes", "on"}:
             text = "resume rejected: open BUY cancellation is still pending"
         elif resume_safety_reason is not None:

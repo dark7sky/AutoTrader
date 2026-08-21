@@ -141,12 +141,13 @@ docker compose --profile smoke run --rm smoke-fill-notice
 
 ## Telegram 운영
 
-Telegram에서는 `/start` 또는 `/menu`를 누르면 메인 메뉴가 표시됩니다. 상태·거래·제어·환경·AI 하위 메뉴의 버튼을 따라가면 주요 조회와 제어 기능에 접근할 수 있으며, 각 하위 메뉴에는 메인 메뉴로 돌아가는 버튼이 있습니다. 버튼으로 이동할 때는 현재 메뉴 메시지를 교체하므로 메뉴 메시지가 계속 쌓이지 않습니다. 기존 명령과 `control:`/`approval:` 콜백도 계속 호환됩니다.
+Telegram에서는 `/start` 또는 `/menu`를 누르면 메인 메뉴가 표시됩니다. `모의매매 준비 점검`에서 Resume blocker를 확인하고, 상태·거래·제어·환경·AI 하위 메뉴의 버튼으로 주요 기능에 접근합니다. 버튼 이동은 현재 메뉴 메시지를 교체하므로 메시지가 쌓이지 않습니다. 시장 휴장은 Resume blocker가 아니며, 기존 명령과 `control:`/`approval:` 콜백도 계속 호환됩니다.
 
 주요 명령:
 
 ```text
 /menu             메인 버튼 메뉴
+/readiness        Resume 전 준비 상태와 blocker
 /control          현재 상태와 제어 버튼
 /status           paused, environment, heartbeat, 불일치 플래그
 /pause [reason]   즉시 일시정지
@@ -164,12 +165,18 @@ Telegram에서는 `/start` 또는 `/menu`를 누르면 메인 메뉴가 표시�
 /report           paper 또는 live 리포트
 /live-report      최근 broker snapshot
 /cost             OpenAI 비용 조회
+/watchlist        활성 관심종목 조회
+/watchlist_add 005930 000660  관심종목 추가
+/watchlist_remove 005930       관심종목 비활성화
+/decisions        최근 cycle 결과와 AI 판단 audit
 /emergency-stop   pause와 emergency stop 활성화
 /cancel-open-buys 알려진 미체결 BUY 취소 요청 후 terminal 확정 대기
 /clear-emergency  paused 상태에서 emergency stop 해제
 ```
 
 `운용 제어` 메뉴의 **미체결 매수 취소** 버튼도 같은 동작을 합니다. `/emergency-stop`과 `/cancel-open-buys`는 runtime을 paused로 만들고, local ledger에 알려진 open BUY에 대해서만 취소를 요청합니다. KIS가 terminal 상태를 확인할 때까지 주문은 `CANCEL_PENDING`이며, 보유 주식을 자동 매도하거나 자동 청산하지 않습니다.
+
+`/resume`과 `거래 재개` 버튼은 `/readiness`의 필수 blocker를 먼저 검사합니다. 주문 게이트, 현재 환경 KIS 키·계좌, OpenAI 키, 관심종목, worker heartbeat, 불일치, emergency/cancel pending이 준비되지 않으면 구체적인 사유와 함께 거부합니다. 실전 one-time challenge arm은 이 검사를 통과한 뒤에만 소비됩니다.
 
 real 전환 순서:
 

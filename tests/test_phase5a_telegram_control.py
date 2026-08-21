@@ -102,9 +102,11 @@ def test_unauthorized_telegram_is_ignored(tmp_path):
     assert fake.sent == []
 
 
-def test_commands_send_status_and_report(tmp_path):
+def test_commands_send_status_and_report(tmp_path, monkeypatch):
     path = tmp_path / "control.sqlite3"
     fake = FakeTelegram()
+    _ready_demo_env(monkeypatch)
+    _ready_demo_db(path)
     update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
     assert handle_update(update("/resume"), str(path), fake, "42") is True
     assert "runtime resumed" in fake.sent[-1][1]
@@ -174,9 +176,11 @@ def test_menu_callback_requires_authorization(tmp_path):
     assert fake.answered == []
 
 
-def test_telegram_environment_switch_is_pause_gated(tmp_path):
+def test_telegram_environment_switch_is_pause_gated(tmp_path, monkeypatch):
     path = tmp_path / "control.sqlite3"
     fake = FakeTelegram()
+    _ready_demo_env(monkeypatch)
+    _ready_demo_db(path)
     update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
 
     assert handle_update(update("/env real"), str(path), fake, "42") is True
@@ -209,3 +213,51 @@ def test_telegram_status_and_positions_show_leftovers(tmp_path):
     assert "open_live_positions: 1" in fake.sent[-1][1]
     assert handle_update(update("/positions"), str(path), fake, "42") is True
     assert "live 005930 qty=2" in fake.sent[-1][1]
+
+
+def _ready_demo_env(monkeypatch):
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("AUTO_TRADE_AI", "rule")
+    monkeypatch.setenv("KIS_DEMO_APP_KEY", "demo-key")
+    monkeypatch.setenv("KIS_DEMO_APP_SECRET", "demo-secret")
+    monkeypatch.setenv("KIS_DEMO_ACCOUNT_NO", "12345678")
+    monkeypatch.setattr(telegram_module, "exchange_calendar_available", lambda: True)
+
+
+def _ready_demo_db(path):
+    with connect_database(path) as database:
+        database.init_schema()
+        database.add_watchlist_symbol("005930")
+        database.record_heartbeat("trading-service")
+        database.record_heartbeat("order-supervisor")
+
+
+def test_readiness_reports_blockers_and_market_closed_is_not_one(tmp_path, monkeypatch):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    _ready_demo_env(monkeypatch)
+    monkeypatch.setattr(telegram_module, "exchange_calendar_available", lambda: True)
+    monkeypatch.setattr(telegram_module, "is_regular_market_open", lambda _: False)
+    with connect_database(path) as database:
+        database.init_schema()
+        database.add_watchlist_symbol("005930")
+        database.record_heartbeat("trading-service")
+        database.record_heartbeat("order-supervisor")
+    assert handle_update({"message": {"chat": {"id": 42}, "text": "/readiness"}}, path, fake, "42")
+    text = fake.sent[-1][1]
+    assert "krx_market_open=false" in text
+    assert "resume_ready=true" in text
+    assert "blockers: none" in text
+
+
+def test_watchlist_commands_validate_and_reactivate_symbols(tmp_path):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
+    assert handle_update(update("/watchlist_add 005930,000660"), path, fake, "42")
+    assert "005930,000660" in fake.sent[-1][1]
+    assert handle_update(update("/watchlist_remove 005930"), path, fake, "42")
+    assert handle_update(update("/watchlist_add 005930"), path, fake, "42")
+    assert "005930" in fake.sent[-1][1]
+    assert handle_update(update("/watchlist_add ABC"), path, fake, "42")
+    assert "6자리" in fake.sent[-1][1]
