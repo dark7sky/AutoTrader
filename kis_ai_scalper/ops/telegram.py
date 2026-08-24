@@ -13,6 +13,7 @@ import requests
 
 from kis_ai_scalper.ops.control import set_environment, set_paused
 from kis_ai_scalper.ops.openai_usage import openai_cost_summary_from_env
+from kis_ai_scalper.ops.performance import performance_report_from_database
 from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.storage import connect_database
 from kis_ai_scalper.market.schedule import exchange_calendar_available, is_regular_market_open
@@ -111,6 +112,7 @@ BOT_COMMANDS = [
     {"command": "watchlist_add", "description": "관심종목 추가"},
     {"command": "watchlist_remove", "description": "관심종목 제거"},
     {"command": "decisions", "description": "최근 AI 판단"},
+    {"command": "performance", "description": "AI 성과"},
     {"command": "status", "description": "서비스 상태"},
     {"command": "control", "description": "운용 제어"},
 ]
@@ -186,7 +188,10 @@ ENVIRONMENT_MENU_KEYBOARD = {
 
 AI_MENU_KEYBOARD = {
     "inline_keyboard": [
-        [{"text": "OpenAI 사용금액", "callback_data": "control:cost"}],
+        [
+            {"text": "OpenAI 사용금액", "callback_data": "control:cost"},
+            {"text": "성과", "callback_data": "control:performance"},
+        ],
         [{"text": "메인 메뉴", "callback_data": "menu:main"}],
     ]
 }
@@ -362,6 +367,7 @@ def _readiness(db_path: str) -> tuple[str, bool]:
         trading_heartbeat = _heartbeat_status(database.get_heartbeat("trading-service"))[1]
         supervisor_heartbeat = _heartbeat_status(database.get_heartbeat("order-supervisor"))[1]
     supervisor_reasons = _supervisor_reasons(supervisor_status)
+    supervisor_detail = _supervisor_detail(supervisor_status)
 
     gate = (optional_env_value("LIVE_TRADING_ENABLED") or "").strip().lower() == "true"
     if not gate:
@@ -400,6 +406,13 @@ def _readiness(db_path: str) -> tuple[str, bool]:
         f"watchlist={','.join(watchlist) or 'none'}",
         f"operator_review={operator_review} block_new_entries={block_entries} emergency={emergency} cancel_pending={str(cancel_pending == 'true' or unresolved).lower()}",
         f"worker_heartbeat=trading-service:{str(trading_heartbeat).lower()} order-supervisor:{str(supervisor_heartbeat).lower()}",
+        f"order_supervisor_status={supervisor_detail['status']} order_supervisor_status_age={supervisor_detail['age']}",
+        (
+            f"failure_streak={supervisor_detail['failure_streak']} "
+            f"healthy_streak={supervisor_detail['healthy_streak']} "
+            f"next_retry_seconds={supervisor_detail['next_retry_seconds']}"
+        ),
+        f"safe_kis_error={supervisor_detail['safe_kis_error']}",
         f"krx_market_open={str(market_open).lower()} (시장 휴장은 resume blocker 아님)",
     ]
     if blockers:
@@ -561,6 +574,13 @@ def _live_report_text(db_path: str) -> str:
     return "live report\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _performance_text(db_path: str) -> str:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        report = performance_report_from_database(database)
+    return report.text()
+
+
 def _safe_flag(value: str | None) -> str:
     if value is None:
         return "unavailable"
@@ -595,6 +615,62 @@ def _supervisor_reasons(value: str | None) -> list[str]:
         if reason:
             reasons.append(reason)
     return reasons
+
+
+def _supervisor_detail(value: str | None) -> dict[str, str]:
+    detail = {
+        "status": "unavailable",
+        "age": "unavailable",
+        "failure_streak": "0",
+        "healthy_streak": "0",
+        "next_retry_seconds": "0",
+        "safe_kis_error": "none",
+    }
+    if not value:
+        return detail
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return detail
+    if not isinstance(payload, dict):
+        return detail
+    status = str(payload.get("status") or "unavailable")
+    detail["status"] = status if status.replace("_", "").replace("-", "").isalnum() else "unavailable"
+    updated_at = payload.get("updated_at")
+    if updated_at:
+        try:
+            timestamp = datetime.fromisoformat(str(updated_at))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            age = (_utcnow() - timestamp.astimezone(timezone.utc)).total_seconds()
+            detail["age"] = f"{age:.1f}s" if age >= 0 else "future"
+        except (TypeError, ValueError):
+            pass
+    for key in ("failure_streak", "healthy_streak", "next_retry_seconds"):
+        try:
+            detail[key] = str(max(0, int(payload.get(key, 0))))
+        except (TypeError, ValueError):
+            detail[key] = "0"
+    safe = payload.get("safe_kis_error")
+    if isinstance(safe, dict):
+        http = _safe_token(safe.get("http_status"))
+        rt_cd = _safe_token(safe.get("rt_cd"))
+        msg_cd = _safe_token(safe.get("msg_cd"))
+        parts = []
+        if http:
+            parts.append(f"http_{http}")
+        if rt_cd:
+            parts.append(f"rt_cd={rt_cd}")
+        if msg_cd:
+            parts.append(f"msg_cd={msg_cd}")
+        if parts:
+            detail["safe_kis_error"] = " ".join(parts)
+    return detail
+
+
+def _safe_token(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text and all(character.isalnum() or character in {"-", "_"} for character in text) else ""
 
 
 def _heartbeat_status(value: str | None) -> tuple[str, bool]:
@@ -789,7 +865,7 @@ def _default_keyboard(command_name: str) -> dict[str, Any]:
         "/environment:demo", "/environment:real",
     }:
         return ENVIRONMENT_MENU_KEYBOARD
-    if command_name in {"/cost", "cost"}:
+    if command_name in {"/cost", "cost", "/performance", "performance"}:
         return AI_MENU_KEYBOARD
     if command_name in {
         "/watchlist", "watchlist", "/watchlist-add", "watchlist-add", "/watchlist-remove", "watchlist-remove",
@@ -992,6 +1068,8 @@ def handle_update(
         text = _live_report_text(db_path)
     elif command_name in {"/cost", "cost"}:
         text = _cost_text()
+    elif command_name in {"/performance", "performance"}:
+        text = _performance_text(db_path)
     else:
         return False
     response_text = _truncate(text)

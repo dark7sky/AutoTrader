@@ -296,7 +296,7 @@ def test_flapping_review_does_not_emit_recovery_or_repeat_warning(tmp_path, monk
         )
 
     assert len(messages) == 1
-    assert "reconciled_operator_review" in messages[0]
+    assert "dependency_unavailable" in messages[0]
 
 
 def test_status_reasons_include_safe_reconciliation_stale_and_cancel_causes(tmp_path, monkeypatch):
@@ -475,7 +475,7 @@ def test_retry_backoff_is_capped_and_interruptible(monkeypatch):
         supervisor.run_order_supervisor("config/settings.yaml", "db.sqlite3", event)
     finally:
         monkeypatch.setattr(threading.Event, "wait", original_wait)
-    assert waits == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0]
+    assert waits == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0, 60.0]
 
 
 def test_stop_event_interrupts_long_interval():

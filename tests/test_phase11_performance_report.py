@@ -60,15 +60,15 @@ def test_performance_report_uses_fifo_net_costs_and_drawdown(tmp_path, monkeypat
 
     assert report.closed_trades == 2
     assert report.gross_realized_pnl == 50.0
-    assert report.estimated_costs == 6.0
-    assert report.net_realized_pnl == 44.0
+    assert report.estimated_costs == 6.075
+    assert report.net_realized_pnl == 43.925
     assert report.win_rate == 0.5
     assert report.average_win == 96.85
-    assert report.average_loss == -52.85
-    assert round(report.profit_factor, 4) == round(96.85 / 52.85, 4)
-    assert report.max_drawdown == 52.85
+    assert report.average_loss == -52.925
+    assert round(report.profit_factor, 4) == round(96.85 / 52.925, 4)
+    assert report.max_drawdown == 52.925
     assert report.by_strategy["PULLBACK_WATCH"].net_realized_pnl == 96.85
-    assert report.by_strategy["UNKNOWN"].net_realized_pnl == -52.85
+    assert report.by_strategy["UNKNOWN"].net_realized_pnl == -52.925
 
 
 def test_performance_report_text_is_operator_readable():

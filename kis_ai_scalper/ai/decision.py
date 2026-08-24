@@ -37,6 +37,9 @@ class TradingAIDecision(BaseModel):
     decision_id: str = Field(default_factory=lambda: f"ai-decision:{uuid4().hex}")
     symbol: str = Field(pattern=r"^\d{6}$")
     action: AIDecisionAction
+    strategy: str | None = Field(default=None, min_length=1, max_length=80)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
+    prompt_version: str | None = Field(default=None, min_length=1, max_length=80)
     confidence: float = Field(ge=0, le=1)
     entry_price: float | None = Field(default=None, gt=0)
     take_profit_price: float | None = Field(default=None, gt=0)
@@ -84,11 +87,19 @@ class RuleBasedAIClient:
     """Deterministic local stand-in for unit tests and API-key-free dry runs."""
 
     def decide(self, context: AIDecisionContext) -> TradingAIDecision:
-        score = max((float(item.get("score", 0)) for item in context.candidates), default=0.0)
+        best = max(
+            context.candidates,
+            key=lambda item: float(item.get("score", 0)),
+            default=None,
+        )
+        score = float(best.get("score", 0)) if best is not None else 0.0
         if context.open_position is not None:
             return TradingAIDecision(
                 symbol=context.symbol,
                 action=AIDecisionAction.HOLD,
+                strategy=None,
+                model="rule",
+                prompt_version=AI_DECISION_PROMPT_VERSION,
                 confidence=0.6,
                 risk_level=AIRiskLevel.LOW,
                 rationale="Existing position is managed by deterministic exits.",
@@ -98,6 +109,9 @@ class RuleBasedAIClient:
             return TradingAIDecision(
                 symbol=context.symbol,
                 action=AIDecisionAction.BUY,
+                strategy=str(best.get("strategy") or "UNKNOWN"),
+                model="rule",
+                prompt_version=AI_DECISION_PROMPT_VERSION,
                 confidence=min(0.95, score),
                 entry_price=entry,
                 stop_loss_price=round(entry * 0.99),
@@ -110,6 +124,9 @@ class RuleBasedAIClient:
         return TradingAIDecision(
             symbol=context.symbol,
             action=AIDecisionAction.HOLD,
+            strategy=None,
+            model="rule",
+            prompt_version=AI_DECISION_PROMPT_VERSION,
             confidence=0.5,
             risk_level=AIRiskLevel.LOW,
             rationale="No candidate passed the deterministic threshold.",
@@ -257,6 +274,12 @@ class OpenAITradingDecisionClient:
                     decision = TradingAIDecision.model_validate(content)
                 else:
                     decision = TradingAIDecision.model_validate_json(content)
+                decision = decision.model_copy(
+                    update={
+                        "model": decision.model or self.model,
+                        "prompt_version": decision.prompt_version or AI_DECISION_PROMPT_VERSION,
+                    }
+                )
                 if decision.symbol != context.symbol:
                     raise AIDecisionResponseError(
                         f"OpenAI response symbol mismatch: expected {context.symbol}, got {decision.symbol}"
@@ -399,6 +422,7 @@ def trading_ai_decision_schema() -> dict[str, Any]:
         "properties": {
             "symbol": {"type": "string", "pattern": "^\\d{6}$"},
             "action": {"type": "string", "enum": [item.value for item in AIDecisionAction]},
+            "strategy": {"type": ["string", "null"], "minLength": 1, "maxLength": 80},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "entry_price": {"type": ["number", "null"], "exclusiveMinimum": 0},
             "take_profit_price": {"type": ["number", "null"], "exclusiveMinimum": 0},
@@ -411,6 +435,7 @@ def trading_ai_decision_schema() -> dict[str, Any]:
         "required": [
             "symbol",
             "action",
+            "strategy",
             "confidence",
             "entry_price",
             "take_profit_price",
@@ -423,9 +448,13 @@ def trading_ai_decision_schema() -> dict[str, Any]:
     }
 
 
+AI_DECISION_PROMPT_VERSION = "trade-decision-v2"
+
+
 _SYSTEM_PROMPT = (
     "You are an intraday Korean equity trading decision engine. "
     "Return only the requested JSON schema. Prefer HOLD unless the setup is clear. "
+    "For BUY, set strategy to one of the provided deterministic candidate strategy values. "
     "For BUY, provide a limit entry near the latest price, take-profit above entry, "
     "stop-loss below entry, and a short max holding time. Mark HIGH risk or "
     "requires_operator_approval when volatility, weak confidence, or ambiguous data "

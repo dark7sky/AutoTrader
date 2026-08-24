@@ -10,6 +10,7 @@ from typing import Any
 from kis_ai_scalper.broker.kis_account import KisAccountSnapshot
 from kis_ai_scalper.broker.kis_buying_power import KisBuyingPowerSnapshot
 from kis_ai_scalper.broker.kis_realized_pnl import KisRealizedPnlSnapshot
+from kis_ai_scalper.ops.performance import build_performance_report, cost_bps_from_env
 from kis_ai_scalper.risk.models import PortfolioState, PositionState
 from kis_ai_scalper.storage.database import Database
 
@@ -68,41 +69,19 @@ def _rows_for_day(database: Database, table: str, day: str) -> list[Any]:
 
 
 def _consecutive_losses(database: Database) -> int | None:
-    """Calculate the trailing loss count from persisted fills using FIFO lots."""
     rows = database.connection.execute(
-        "SELECT * FROM broker_fills ORDER BY filled_at, fill_id"
+        """SELECT f.*, COALESCE(a.strategy, 'UNKNOWN') AS strategy
+           FROM broker_fills f
+           JOIN broker_orders o ON o.client_order_id=f.client_order_id
+           LEFT JOIN ai_decision_audits a ON a.decision_id=o.signal_id
+           ORDER BY f.filled_at, f.fill_id"""
     ).fetchall()
-    lots: dict[str, deque[tuple[int, float]]] = defaultdict(deque)
-    outcomes: list[float] = []
-    for row in rows:
-        symbol = str(row["symbol"] or "")
-        side = str(row["side"] or "").upper()
-        try:
-            quantity = int(row["quantity"])
-            price = float(row["price"])
-        except (TypeError, ValueError):
-            return None
-        if not symbol or quantity <= 0 or price <= 0 or side not in {"BUY", "SELL"}:
-            return None
-        if side == "BUY":
-            lots[symbol].append((quantity, price))
-            continue
-        remaining = quantity
-        realized = 0.0
-        while remaining:
-            if not lots[symbol]:
-                return None
-            lot_quantity, lot_price = lots[symbol][0]
-            matched = min(remaining, lot_quantity)
-            realized += (price - lot_price) * matched
-            remaining -= matched
-            if matched == lot_quantity:
-                lots[symbol].popleft()
-            else:
-                lots[symbol][0] = (lot_quantity - matched, lot_price)
-        outcomes.append(realized)
+    try:
+        report = build_performance_report(rows)
+    except ValueError:
+        return None
     losses = 0
-    for outcome in reversed(outcomes):
+    for outcome in reversed(report.outcomes):
         if outcome < 0:
             losses += 1
         else:
@@ -115,11 +94,9 @@ def calculate_local_daily_realized_pnl(
     *,
     now: datetime | None = None,
 ) -> float | None:
-    """Return KST-day gross realized P/L from reconciled fills using FIFO.
+    """Return KST-day estimated net realized P/L from reconciled fills using FIFO.
 
-    This fallback excludes commissions, taxes, and other fees because the local
-    ``broker_fills`` schema stores only quantity and execution price. It fails
-    closed unless the latest reconciliation completed without operator review.
+    It fails closed unless the latest reconciliation completed without operator review.
     Historical fills are consumed to establish FIFO cost basis, while only
     sells on the current Asia/Seoul trading date contribute to the result.
     """
@@ -148,11 +125,16 @@ def calculate_local_daily_realized_pnl(
         reconciliation_times.append(reconciled_at.astimezone(timezone.utc))
     reconciled_through = min(reconciliation_times)
 
+    rows = database.connection.execute(
+        """SELECT f.*, COALESCE(a.strategy, 'UNKNOWN') AS strategy
+           FROM broker_fills f
+           JOIN broker_orders o ON o.client_order_id=f.client_order_id
+           LEFT JOIN ai_decision_audits a ON a.decision_id=o.signal_id
+           ORDER BY f.filled_at, f.fill_id"""
+    ).fetchall()
+    buy_cost_bps, sell_cost_bps = cost_bps_from_env()
     lots: dict[str, deque[tuple[int, float]]] = defaultdict(deque)
     realized = 0.0
-    rows = database.connection.execute(
-        "SELECT * FROM broker_fills ORDER BY filled_at, fill_id"
-    ).fetchall()
     for row in rows:
         symbol = str(row["symbol"] or "")
         side = str(row["side"] or "").upper()
@@ -162,12 +144,7 @@ def calculate_local_daily_realized_pnl(
             filled_at = datetime.fromisoformat(str(row["filled_at"]))
         except (TypeError, ValueError):
             return None
-        if (
-            not symbol
-            or quantity <= 0
-            or price <= 0
-            or side not in {"BUY", "SELL"}
-        ):
+        if not symbol or quantity <= 0 or price <= 0 or side not in {"BUY", "SELL"}:
             return None
         filled_at = _as_aware_kst(filled_at)
         if filled_at.astimezone(timezone.utc) > timestamp.astimezone(timezone.utc):
@@ -185,7 +162,14 @@ def calculate_local_daily_realized_pnl(
                 return None
             lot_quantity, lot_price = lots[symbol][0]
             matched = min(remaining, lot_quantity)
-            sell_realized += (price - lot_price) * matched
+            buy_notional = lot_price * matched
+            sell_notional = price * matched
+            sell_realized += (
+                sell_notional
+                - buy_notional
+                - buy_notional * buy_cost_bps / 10_000
+                - sell_notional * sell_cost_bps / 10_000
+            )
             remaining -= matched
             if matched == lot_quantity:
                 lots[symbol].popleft()
@@ -193,7 +177,7 @@ def calculate_local_daily_realized_pnl(
                 lots[symbol][0] = (lot_quantity - matched, lot_price)
         if filled_at.astimezone(KST).date() == target_date:
             realized += sell_realized
-    return realized
+    return round(realized, 10)
 
 
 def build_portfolio_risk_snapshot(

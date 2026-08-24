@@ -129,6 +129,21 @@ def smoke_kis(config_path: str, environment: str, symbol: str, refresh_token: bo
     return 0
 
 
+def smoke_broker_state(config_path: str, environment: str, refresh_token: bool = False) -> int:
+    order_status_client, account_client = _broker_clients(
+        config_path, KisEnvironment.parse(environment), refresh_token=refresh_token,
+    )
+    orders = tuple(order_status_client.get_today_orders())
+    account = account_client.get_snapshot()
+    print("KIS broker state smoke: OK")
+    print(
+        f"environment={KisEnvironment.parse(environment).value} orders={len(orders)} "
+        f"positions={len(account.positions)}"
+    )
+    print("broker_writes=none current_price_queries=none websocket_subscriptions=none")
+    return 0
+
+
 def smoke_ws(config_path: str, environment: str, symbol: str, seconds: int,
              refresh_token: bool = False) -> int:
     if seconds < 1 or seconds > 60:
@@ -1186,6 +1201,57 @@ def _account_components(account_no: str, account_product_code: str) -> tuple[str
     return digits, account_product_code
 
 
+def _broker_clients(
+    config_path: str,
+    environment: KisEnvironment,
+    *,
+    refresh_token: bool = False,
+) -> tuple[KisOrderStatusClient, KisAccountClient]:
+    config = load_config(Path(config_path))
+    kis_api = _kis_api_for(config, environment)
+    kis_account = _kis_account_for(config, environment)
+    account_no, account_product_code = _account_components(
+        kis_account.account_no, kis_account.account_product_code,
+    )
+    project_root = Path(config_path).resolve().parent.parent
+    cache_path = project_root / "data" / "auth" / f"kis_token_{environment.value}.json"
+    auth_result = KisAuthClient(
+        environment, kis_api.app_key, kis_api.app_secret,
+    ).authenticate_read_only(cache_path=cache_path, refresh_token=refresh_token)
+    common = {
+        "environment": environment,
+        "app_key": kis_api.app_key,
+        "app_secret": kis_api.app_secret,
+        "access_token": auth_result.access_token,
+        "account_no": account_no,
+        "account_product_code": account_product_code,
+    }
+    return KisOrderStatusClient(**common), KisAccountClient(**common)
+
+
+def _supervisor_gate_unknown_fields(database: object, now: datetime) -> set[str]:
+    heartbeat = database.get_heartbeat("order-supervisor")
+    if heartbeat is None:
+        return {"order_supervisor"}
+    try:
+        heartbeat_at = datetime.fromisoformat(str(heartbeat))
+    except ValueError:
+        return {"order_supervisor"}
+    if heartbeat_at.tzinfo is None:
+        heartbeat_at = heartbeat_at.replace(tzinfo=timezone.utc)
+    max_age = float(_env_number("SERVICE_HEARTBEAT_MAX_AGE_SECONDS", 180, minimum=1))
+    if (now.astimezone(timezone.utc) - heartbeat_at.astimezone(timezone.utc)).total_seconds() > max_age:
+        return {"order_supervisor"}
+    raw_status = database.get_runtime_metadata("order-supervisor.status")
+    try:
+        payload = json.loads(raw_status or "{}")
+    except (TypeError, ValueError):
+        return {"order_supervisor"}
+    if not isinstance(payload, dict) or payload.get("status") != "reconciled":
+        return {"order_supervisor"}
+    return set()
+
+
 @dataclass(frozen=True)
 class _BrokerCycleState:
     order_client: KisOrderClient
@@ -1237,11 +1303,18 @@ def _make_broker_cycle_state(
     with connect_database(db_path) as database:
         database.init_schema()
         cycle_time = kst_now()
-        reconciliation = reconcile_broker_state(
-            database, order_status_client, account_client, current_time=cycle_time,
-        )
-        order_management = (
-            manage_stale_orders(
+        if manage_orders:
+            broker_orders = tuple(order_status_client.get_today_orders())
+            account = account_client.get_snapshot()
+            reconciliation = reconcile_broker_state(
+                database,
+                order_status_client,
+                account_client,
+                current_time=cycle_time,
+                broker_orders=broker_orders,
+                account_snapshot=account,
+            )
+            order_management = manage_stale_orders(
                 database,
                 order_status_client,
                 current_time=cycle_time,
@@ -1253,11 +1326,14 @@ def _make_broker_cycle_state(
                         "SELL_ORDER_TTL_SECONDS", 30, minimum=0,
                     ),
                 ),
+                broker_orders=broker_orders,
             )
-            if manage_orders
-            else OrderManagementReport()
-        )
-        account = account_client.get_snapshot()
+            supervisor_unknown = set()
+        else:
+            account = account_client.get_snapshot()
+            reconciliation = ReconciliationReport()
+            order_management = OrderManagementReport()
+            supervisor_unknown = _supervisor_gate_unknown_fields(database, cycle_time)
         buying_power: KisBuyingPowerSnapshot | None = None
         prices: list[tuple[str, float]] = []
         for symbol in dict.fromkeys([*symbols, *(position.symbol for position in account.positions)]):
@@ -1308,6 +1384,7 @@ def _make_broker_cycle_state(
             unknown.add("buying_power_fields")
         if environment is KisEnvironment.REAL and realized_error:
             unknown.add("realized_pnl")
+        unknown.update(supervisor_unknown)
         if reconciliation.block_new_entries:
             unknown.add("broker_reconciliation")
         if order_management.entries_blocked:
@@ -1935,6 +2012,10 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--env", choices=[env.value for env in KisEnvironment], default=os.getenv("KIS_ENV", "demo"))
     smoke.add_argument("--symbol", default="005930")
     smoke.add_argument("--refresh-token", action="store_true", help="ignore the local token cache")
+    broker_state = subparsers.add_parser("smoke-broker-state", help="read-only KIS order/account state check")
+    broker_state.add_argument("--config", default="config/settings.yaml")
+    broker_state.add_argument("--env", choices=[env.value for env in KisEnvironment], default=os.getenv("KIS_ENV", "demo"))
+    broker_state.add_argument("--refresh-token", action="store_true", help="ignore the local token cache")
     ws = subparsers.add_parser("smoke-ws", help="read-only KIS realtime price subscription")
     ws.add_argument("--config", default="config/settings.yaml")
     ws.add_argument("--env", choices=[env.value for env in KisEnvironment], default=os.getenv("KIS_ENV", "demo"))
@@ -2077,6 +2158,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "smoke-kis":
             return smoke_kis(args.config, args.env, args.symbol, args.refresh_token)
+        if args.command == "smoke-broker-state":
+            return smoke_broker_state(args.config, args.env, args.refresh_token)
         if args.command == "smoke-ws":
             return smoke_ws(args.config, args.env, args.symbol, args.seconds, args.refresh_token)
         if args.command == "smoke-fill-notice":
@@ -2161,7 +2244,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     except Exception as exc:
         if args.command in {
-            "smoke-kis", "smoke-ws", "smoke-fill-notice", "collect-market", "user-test",
+            "smoke-kis", "smoke-broker-state", "smoke-ws", "smoke-fill-notice", "collect-market", "user-test",
             "paper-session", "submit-live-shadow", "auto-trade-cycle",
             "service-loop",
         }:

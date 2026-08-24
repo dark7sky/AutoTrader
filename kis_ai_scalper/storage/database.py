@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS ai_decision_audits (
     requires_operator_approval INTEGER NOT NULL CHECK (requires_operator_approval IN (0, 1)),
     rationale TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    strategy TEXT NOT NULL DEFAULT 'UNKNOWN',
+    model TEXT NOT NULL DEFAULT 'UNKNOWN',
+    prompt_version TEXT NOT NULL DEFAULT 'UNKNOWN',
     max_holding_seconds INTEGER
 );
 CREATE TABLE IF NOT EXISTS approval_requests (
@@ -338,6 +341,16 @@ class Database:
             self.connection.execute(
                 "ALTER TABLE ai_decision_audits ADD COLUMN max_holding_seconds INTEGER"
             )
+        decision_additions = {
+            "strategy": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "model": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "prompt_version": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+        }
+        for name, type_name in decision_additions.items():
+            if name not in decision_columns:
+                self.connection.execute(
+                    f"ALTER TABLE ai_decision_audits ADD COLUMN {name} {type_name}"
+                )
         approval_columns = {
             str(row["name"])
             for row in self.connection.execute("PRAGMA table_info(approval_requests)").fetchall()
@@ -1046,6 +1059,9 @@ class Database:
         stop_loss_price: float | None, risk_level: str,
         requires_operator_approval: bool, rationale: str,
         max_holding_seconds: int | None = None,
+        strategy: str | None = None,
+        model: str | None = None,
+        prompt_version: str | None = None,
         created_at: datetime | None = None,
     ) -> bool:
         _validate_symbol(symbol)
@@ -1057,13 +1073,16 @@ class Database:
                 """INSERT OR IGNORE INTO ai_decision_audits
                    (decision_id,symbol,action,confidence,entry_price,take_profit_price,
                     stop_loss_price,risk_level,requires_operator_approval,rationale,created_at,
-                    max_holding_seconds)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    max_holding_seconds,strategy,model,prompt_version)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     decision_id, symbol, action, confidence, entry_price,
                     take_profit_price, stop_loss_price, risk_level,
                     int(requires_operator_approval), rationale, timestamp,
                     max_holding_seconds,
+                    (strategy or "UNKNOWN").strip() or "UNKNOWN",
+                    (model or "UNKNOWN").strip() or "UNKNOWN",
+                    (prompt_version or "UNKNOWN").strip() or "UNKNOWN",
                 ),
             )
         return cursor.rowcount > 0

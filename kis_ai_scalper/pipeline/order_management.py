@@ -79,6 +79,8 @@ def manage_stale_orders(
     current_time: datetime | None = None,
     config: OrderManagementConfig | None = None,
     entry_bar_key: str | None = None,
+    broker_orders: Any | None = None,
+    broker_orders_error: BaseException | None = None,
 ) -> OrderManagementReport:
     """Cancel stale unfilled orders once and leave them pending until reconcile.
 
@@ -90,15 +92,25 @@ def manage_stale_orders(
     now = current_time or datetime.now().astimezone()
     policy = config or OrderManagementConfig()
     actions: list[OrderManagementAction] = []
-    try:
-        broker_orders = tuple(order_status_client.get_today_orders())
-    except Exception as exc:
-        _block_new_entries(database, f"order_status_unavailable:{type(exc).__name__}")
+    if broker_orders_error is not None:
+        _block_new_entries(database, f"order_status_unavailable:{type(broker_orders_error).__name__}")
         return OrderManagementReport(
             operator_review=True,
             block_new_entries=True,
             actions=(OrderManagementAction("", "", "UNKNOWN", "order_status_unavailable"),),
         )
+    if broker_orders is None:
+        try:
+            broker_orders = tuple(order_status_client.get_today_orders())
+        except Exception as exc:
+            _block_new_entries(database, f"order_status_unavailable:{type(exc).__name__}")
+            return OrderManagementReport(
+                operator_review=True,
+                block_new_entries=True,
+                actions=(OrderManagementAction("", "", "UNKNOWN", "order_status_unavailable"),),
+            )
+    else:
+        broker_orders = tuple(broker_orders)
 
     by_broker_id = {str(order.order_number): order for order in broker_orders if order.order_number}
     rows = database.connection.execute(

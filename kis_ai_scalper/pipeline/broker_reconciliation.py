@@ -48,6 +48,10 @@ def reconcile_broker_state(
     account_client: KisAccountClient,
     *,
     current_time: datetime | None = None,
+    broker_orders: Iterable[KisOrderStatusRecord] | None = None,
+    broker_orders_error: BaseException | None = None,
+    account_snapshot: Any | None = None,
+    account_snapshot_error: BaseException | None = None,
 ) -> ReconciliationReport:
     """Reconcile local active orders and positions with same-day KIS state.
 
@@ -61,11 +65,17 @@ def reconcile_broker_state(
     new_fills = 0
     materialized_fills = 0
 
-    try:
-        broker_orders = tuple(order_status_client.get_today_orders())
-    except Exception as exc:
-        reasons.append(f"order_status_unavailable:{_exception_code(exc)}")
+    if broker_orders_error is not None:
+        reasons.append(f"order_status_unavailable:{_exception_code(broker_orders_error)}")
         return _finish(database, now, updated_orders, new_fills, materialized_fills, reasons)
+    if broker_orders is None:
+        try:
+            broker_orders = tuple(order_status_client.get_today_orders())
+        except Exception as exc:
+            reasons.append(f"order_status_unavailable:{_exception_code(exc)}")
+            return _finish(database, now, updated_orders, new_fills, materialized_fills, reasons)
+    else:
+        broker_orders = tuple(broker_orders)
 
     by_broker_id = {order.order_number: order for order in broker_orders if order.order_number}
     local_rows = database.connection.execute(
@@ -165,11 +175,17 @@ def reconcile_broker_state(
         }:
             reasons.append(f"broker_only_open_order:{broker.order_number}")
 
-    try:
-        account = account_client.get_snapshot()
-    except Exception as exc:
-        reasons.append(f"account_snapshot_unavailable:{_exception_code(exc)}")
+    if account_snapshot_error is not None:
+        reasons.append(f"account_snapshot_unavailable:{_exception_code(account_snapshot_error)}")
         return _finish(database, now, updated_orders, new_fills, materialized_fills, reasons)
+    if account_snapshot is None:
+        try:
+            account = account_client.get_snapshot()
+        except Exception as exc:
+            reasons.append(f"account_snapshot_unavailable:{_exception_code(exc)}")
+            return _finish(database, now, updated_orders, new_fills, materialized_fills, reasons)
+    else:
+        account = account_snapshot
 
     local_positions = _local_position_quantities(database)
     broker_positions = {position.symbol: int(position.qty) for position in account.positions}

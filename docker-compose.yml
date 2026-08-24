@@ -24,6 +24,18 @@ services:
       - ${DATA_DIR:-./data}:/app/data
     command: ["python", "-m", "kis_ai_scalper.cli", "smoke-kis", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}", "--symbol", "005930"]
     profiles: ["smoke"]
+  smoke-broker-state:
+    build:
+      context: .
+      target: runtime
+    environment:
+      LIVE_TRADING_ENABLED: "false"
+      KIS_ENV: "${KIS_ENV:-demo}"
+    volumes:
+      - ./.env:/app/.env:ro
+      - ${DATA_DIR:-./data}:/app/data
+    command: ["python", "-m", "kis_ai_scalper.cli", "smoke-broker-state", "--config", "config/settings.yaml", "--env", "${KIS_ENV:-demo}"]
+    profiles: ["smoke"]
   smoke-ws:
     build:
       context: .
@@ -152,6 +164,8 @@ services:
       MAX_TRADES_PER_DAY: "${MAX_TRADES_PER_DAY:-10}"
       MAX_ORDERS_PER_SYMBOL: "${MAX_ORDERS_PER_SYMBOL:-3}"
       AI_MIN_CONFIDENCE: "${AI_MIN_CONFIDENCE:-0.75}"
+      ESTIMATED_BUY_COST_BPS: "${ESTIMATED_BUY_COST_BPS:-15}"
+      ESTIMATED_SELL_COST_BPS: "${ESTIMATED_SELL_COST_BPS:-15}"
       MARKET_TICK_RETENTION_DAYS: "${MARKET_TICK_RETENTION_DAYS:-7}"
       MARKET_BAR_RETENTION_DAYS: "${MARKET_BAR_RETENTION_DAYS:-365}"
       BUY_ORDER_TTL_SECONDS: "${BUY_ORDER_TTL_SECONDS:-60}"

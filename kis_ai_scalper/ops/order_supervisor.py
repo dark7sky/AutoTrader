@@ -58,6 +58,8 @@ class SupervisorState:
     last_notification_state: str | None = None
     last_notification_at: float = 0.0
     healthy_iterations: int = 0
+    dependency_failure_streak: int = 0
+    dependency_healthy_streak: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,19 @@ def _safe_reason(value: Any) -> str:
     if text in {"TimeoutError", "KisHttpError", "ValueError", "TypeError"}:
         return text
     code = parts[0].strip().lower() or "unknown"
+    safe_details = [
+        part
+        for part in parts[1:]
+        if (
+            part.startswith("http_")
+            or part.startswith("rt_cd_")
+            or part.startswith("msg_cd_")
+            or part == "KisHttpError"
+        )
+        and all(character.isalnum() or character in {"-", "_"} for character in part)
+    ]
+    if safe_details:
+        return ":".join([code, *safe_details])
     if len(parts) > 1:
         detail = parts[-1].strip()
         if detail in {"TimeoutError", "KisHttpError", "ValueError", "TypeError"}:
@@ -111,6 +126,41 @@ def _status_reasons(reconciliation: Any, management: Any, cancel_report: _Cancel
     if cancel_report.error_type:
         reasons.append(f"cancel:{_safe_reason(cancel_report.error_type)}")
     return list(dict.fromkeys(reasons))
+
+
+def _is_dependency_reason(reason: str) -> bool:
+    return any(
+        marker in reason
+        for marker in (
+            "order_status_unavailable",
+            "account_snapshot_unavailable",
+            "dependency_unavailable",
+        )
+    )
+
+
+def _safe_kis_error_from_reasons(reasons: list[str] | tuple[str, ...]) -> dict[str, str] | None:
+    for reason in reasons:
+        parts = str(reason).split(":")
+        if "KisHttpError" not in parts:
+            continue
+        result: dict[str, str] = {}
+        for part in parts:
+            if part.startswith("http_"):
+                result["http_status"] = part.removeprefix("http_")
+            elif part.startswith("rt_cd_"):
+                result["rt_cd"] = part.removeprefix("rt_cd_")
+            elif part.startswith("msg_cd_"):
+                result["msg_cd"] = part.removeprefix("msg_cd_")
+        if result:
+            return result
+    return None
+
+
+def _dependency_backoff_seconds(failure_streak: int) -> int:
+    if failure_streak <= 0:
+        return 0
+    return min(60, 5 * (2 ** (failure_streak - 1)))
 
 
 def _now() -> datetime:
@@ -305,6 +355,10 @@ def _write_status(
     block_new_entries: bool = False,
     error: str | None = None,
     reasons: list[str] | tuple[str, ...] = (),
+    failure_streak: int = 0,
+    healthy_streak: int = 0,
+    next_retry_seconds: int = 0,
+    safe_kis_error: dict[str, str] | None = None,
     now: datetime,
 ) -> None:
     payload = {
@@ -314,8 +368,13 @@ def _write_status(
         "operator_review": bool(operator_review),
         "block_new_entries": bool(block_new_entries),
         "reasons": list(dict.fromkeys(reasons)),
+        "failure_streak": int(failure_streak),
+        "healthy_streak": int(healthy_streak),
+        "next_retry_seconds": int(next_retry_seconds),
         "updated_at": now.isoformat(),
     }
+    if safe_kis_error:
+        payload["safe_kis_error"] = dict(safe_kis_error)
     database.set_runtime_metadata(STATUS_KEY, json.dumps(payload, sort_keys=True), updated_at=now)
     database.set_runtime_metadata(LAST_ERROR_KEY, error or "none", updated_at=now)
     database.record_heartbeat(SUPERVISOR_COMPONENT, heartbeat_at=now)
@@ -370,6 +429,8 @@ def _cancel_requested_buys(
     order_status_client: KisOrderStatusClient,
     *,
     now: datetime,
+    broker_orders: Any | None = None,
+    broker_orders_error: BaseException | None = None,
 ) -> _CancelReport:
     if (database.get_runtime_metadata(CANCEL_REQUEST_KEY) or "").strip().lower() != "true":
         return _CancelReport()
@@ -384,10 +445,8 @@ def _cancel_requested_buys(
            WHERE side='BUY' AND status IN ('ACKNOWLEDGED','PARTIALLY_FILLED')
            ORDER BY created_at, client_order_id"""
     ).fetchall()
-    try:
-        broker_orders = tuple(order_status_client.get_today_orders()) if rows else ()
-    except Exception as exc:
-        error_type = _sanitized_error(exc)
+    if broker_orders_error is not None and rows:
+        error_type = _sanitized_error(broker_orders_error)
         database.set_runtime_metadata("operator_review", "true", updated_at=now)
         database.set_runtime_metadata("block_new_entries", "true", updated_at=now)
         _set_cancel_status(
@@ -395,6 +454,20 @@ def _cancel_requested_buys(
             error_type=error_type, now=now,
         )
         return _CancelReport(errors=1, error_type=error_type)
+    if broker_orders is None:
+        try:
+            broker_orders = tuple(order_status_client.get_today_orders()) if rows else ()
+        except Exception as exc:
+            error_type = _sanitized_error(exc)
+            database.set_runtime_metadata("operator_review", "true", updated_at=now)
+            database.set_runtime_metadata("block_new_entries", "true", updated_at=now)
+            _set_cancel_status(
+                database, status="error", requested=0, errors=1, skipped=0,
+                error_type=error_type, now=now,
+            )
+            return _CancelReport(errors=1, error_type=error_type)
+    else:
+        broker_orders = tuple(broker_orders) if rows else ()
 
     by_id = {str(order.order_number): order for order in broker_orders if order.order_number}
     for local in rows:
@@ -510,13 +583,37 @@ def one_iteration(
                 state.force_refresh = False
             order_status_client, account_client = state.clients
 
+            broker_orders: tuple[Any, ...] | None = None
+            broker_orders_error: BaseException | None = None
+            account_snapshot: Any | None = None
+            account_snapshot_error: BaseException | None = None
+            try:
+                broker_orders = tuple(order_status_client.get_today_orders())
+            except Exception as exc:
+                broker_orders_error = exc
+            if broker_orders_error is None:
+                try:
+                    account_snapshot = account_client.get_snapshot()
+                except Exception as exc:
+                    account_snapshot_error = exc
             reconciliation = reconcile_broker_state(
-                database, order_status_client, account_client, current_time=current
+                database,
+                order_status_client,
+                account_client,
+                current_time=current,
+                broker_orders=broker_orders,
+                broker_orders_error=broker_orders_error,
+                account_snapshot=account_snapshot,
+                account_snapshot_error=account_snapshot_error,
             )
             if _report_needs_refresh(reconciliation):
                 state.force_refresh = True
             cancel_report = _cancel_requested_buys(
-                database, order_status_client, now=current
+                database,
+                order_status_client,
+                now=current,
+                broker_orders=broker_orders,
+                broker_orders_error=broker_orders_error,
             )
             if _looks_like_auth_error(cancel_report.error_type):
                 state.force_refresh = True
@@ -528,11 +625,35 @@ def one_iteration(
                     buy_ttl_seconds=buy_ttl_seconds,
                     sell_ttl_seconds=sell_ttl_seconds,
                 ),
+                broker_orders=broker_orders,
+                broker_orders_error=broker_orders_error,
             )
             review = bool(reconciliation.operator_review or management.operator_review or cancel_report.errors)
             blocked = bool(reconciliation.block_new_entries or management.block_new_entries or cancel_report.errors)
-            status = "reconciled_operator_review" if review else "reconciled"
             reasons = _status_reasons(reconciliation, management, cancel_report)
+            dependency_unavailable = bool(review and any(_is_dependency_reason(reason) for reason in reasons))
+            if dependency_unavailable:
+                state.dependency_failure_streak += 1
+                state.dependency_healthy_streak = 0
+            else:
+                state.dependency_failure_streak = 0
+                state.dependency_healthy_streak += 1
+            status = (
+                "dependency_unavailable"
+                if dependency_unavailable
+                else "reconciled_operator_review" if review else "reconciled"
+            )
+            next_retry_seconds = (
+                _dependency_backoff_seconds(state.dependency_failure_streak)
+                if dependency_unavailable else 0
+            )
+            safe_kis_error = _safe_kis_error_from_reasons(reasons)
+            database.set_runtime_metadata(
+                "operator_review", "true" if review else "false", updated_at=current
+            )
+            database.set_runtime_metadata(
+                "block_new_entries", "true" if blocked else "false", updated_at=current
+            )
             _write_status(
                 database,
                 status=status,
@@ -541,9 +662,13 @@ def one_iteration(
                 operator_review=review,
                 block_new_entries=blocked,
                 reasons=reasons,
+                failure_streak=state.dependency_failure_streak,
+                healthy_streak=state.dependency_healthy_streak,
+                next_retry_seconds=next_retry_seconds,
+                safe_kis_error=safe_kis_error,
                 now=current,
             )
-            if status == "reconciled_operator_review":
+            if status in {"reconciled_operator_review", "dependency_unavailable"}:
                 state.healthy_iterations = 0
                 reason_text = ", ".join(reasons) if reasons else "operator_review"
                 _notify(
@@ -559,8 +684,9 @@ def one_iteration(
                 state.healthy_iterations += 1
                 if (
                     state.healthy_iterations >= RECOVERY_HEALTHY_ITERATIONS
+                    and state.dependency_healthy_streak >= RECOVERY_HEALTHY_ITERATIONS
                     and state.last_notification_state in {
-                        "reconciled_operator_review", "error", "lease_invalid"
+                        "reconciled_operator_review", "dependency_unavailable", "error", "lease_invalid"
                     }
                 ):
                     _notify(
@@ -618,7 +744,7 @@ def run_order_supervisor(
     if interval_seconds <= 0 or buy_ttl_seconds < 0 or sell_ttl_seconds < 0:
         raise ValueError("interval must be positive and TTLs must be non-negative")
     state = SupervisorState()
-    backoff = 1.0
+    backoff = 5.0
     last: OrderSupervisorResult | None = None
     while not stop_event.is_set():
         started = time.monotonic()
@@ -639,14 +765,14 @@ def run_order_supervisor(
         refresh_token = False
         if last.status == "lease_invalid":
             return last
-        if last.status == "error":
+        if last.status in {"error", "dependency_unavailable"}:
             if last.auth_refresh_requested:
                 state.force_refresh = True
             if stop_event.wait(min(backoff, 60.0)):
                 break
             backoff = min(backoff * 2.0, 60.0)
             continue
-        backoff = 1.0
+        backoff = 5.0
         remaining = max(0.0, interval_seconds - (time.monotonic() - started))
         if stop_event.wait(remaining):
             break

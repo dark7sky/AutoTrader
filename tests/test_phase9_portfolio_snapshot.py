@@ -243,7 +243,7 @@ def test_local_daily_realized_pnl_requires_completed_reconciliation():
         assert calculate_local_daily_realized_pnl(database, now=NOW) is None
 
 
-def test_local_daily_realized_pnl_uses_kst_day_fifo_gross_without_fees():
+def test_local_daily_realized_pnl_uses_kst_day_fifo_net_with_estimated_costs():
     now = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)  # 10:00 KST
     with connect_database(":memory:") as database:
         database.init_schema()
@@ -252,9 +252,9 @@ def test_local_daily_realized_pnl_uses_kst_day_fifo_gross_without_fees():
         _add_fill(database, "buy-newer", "BUY", 1, 120, datetime(2026, 8, 17, 6, tzinfo=timezone.utc))
         # 2026-08-17 23:59 KST: consumes one old FIFO share but is not today's P/L.
         _add_fill(database, "sell-prior-kst", "SELL", 1, 105, datetime(2026, 8, 17, 14, 59, tzinfo=timezone.utc))
-        # 2026-08-18 09:30 KST: (90-100) + (90-120) = -40 gross.
+        # 2026-08-18 09:30 KST: -40 gross minus estimated 15bp/15bp costs.
         _add_fill(database, "sell-today-kst", "SELL", 2, 90, datetime(2026, 8, 18, 0, 30, tzinfo=timezone.utc))
-        assert calculate_local_daily_realized_pnl(database, now=now) == -40
+        assert calculate_local_daily_realized_pnl(database, now=now) == -40.6
 
 
 def test_local_daily_realized_pnl_rejects_stale_reconciliation_day():
@@ -300,7 +300,7 @@ def test_portfolio_uses_reconciled_local_realized_pnl_fallback():
             account(pnl=None), database, now=now,
             buying_power=KisBuyingPowerSnapshot("005930", 100, 500, 500, 500, 5, {}),
         )
-        assert result.portfolio.daily_pnl_krw == -10
+        assert result.portfolio.daily_pnl_krw == -10.285
         assert "daily_pnl" not in result.unknown_fields
 
 

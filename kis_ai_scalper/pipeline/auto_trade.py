@@ -324,6 +324,10 @@ def _maybe_enter_position(
         return _blocked(symbol, "ai_symbol_mismatch")
     if decision.action is not AIDecisionAction.BUY:
         return _blocked(symbol, f"ai_{decision.action.value.lower()}")
+    if decision.strategy is None and _is_network_decision_client(ai_client):
+        return _blocked(symbol, "ai_strategy_required")
+    if decision.strategy is not None and decision.strategy not in _candidate_strategies(candidates):
+        return _blocked(symbol, "ai_strategy_not_in_candidates")
     assert decision.entry_price is not None
     assert decision.stop_loss_price is not None
     assert decision.take_profit_price is not None
@@ -802,8 +806,19 @@ def _record_decision(database: Database, decision: TradingAIDecision, now: datet
         requires_operator_approval=decision.requires_operator_approval,
         rationale=decision.rationale,
         max_holding_seconds=decision.max_holding_seconds,
+        strategy=decision.strategy,
+        model=decision.model,
+        prompt_version=decision.prompt_version,
         created_at=now,
     )
+
+
+def _candidate_strategies(candidates: list[Any]) -> set[str]:
+    return {
+        str(getattr(candidate, "strategy", "") or "").strip()
+        for candidate in candidates
+        if str(getattr(candidate, "strategy", "") or "").strip()
+    }
 
 
 def _blocked(symbol: str, reason: str) -> AutoTradeSymbolResult:

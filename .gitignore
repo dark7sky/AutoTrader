@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.coverage
 .pytest-tmp/
 .tmp_pytest*/
 .tmp_agent*/
@@ -19,3 +20,4 @@ logs/
 *.sqlite3
 .idea/
 .vscode/
+.github/workflows/*.yml

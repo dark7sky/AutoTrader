@@ -18,11 +18,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0,<9"]
+dev = [
+    "pip-audit>=2.7,<3",
+    "pytest>=9.0.3,<10",
+    "pytest-cov>=5.0,<7",
+]
 
 [tool.setuptools.packages.find]
 include = ["kis_ai_scalper*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --basetemp=.tmp_pytest -p no:cacheprovider"
+addopts = "-q --basetemp=.tmp_pytest -p no:cacheprovider --cov=kis_ai_scalper --cov-report=term-missing --cov-fail-under=80"

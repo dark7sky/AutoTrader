@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 import requests
 
-from .kis_auth import _raise_for_kis_response
+from .kis_auth import KisHttpError, _raise_for_kis_response
 from .kis_endpoints import KisEnvironment, api_url
 from .kis_order import KisOrderSide
 
@@ -218,7 +218,17 @@ def _payload(response: Any, secret_values: tuple[str, ...]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("KIS response was not an object")
     if str(payload.get("rt_cd", "1")) != "0":
-        raise RuntimeError("KIS order status request failed")
+        details: dict[str, str] = {}
+        for key in ("rt_cd", "msg_cd", "msg1", "error_description"):
+            value = payload.get(key)
+            if value in (None, ""):
+                continue
+            safe_value = str(value)
+            for secret in secret_values:
+                if secret:
+                    safe_value = safe_value.replace(secret, "[redacted]")
+            details[key] = safe_value[:300]
+        raise KisHttpError(int(getattr(response, "status_code", 200)), details)
     return payload
 
 
