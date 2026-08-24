@@ -281,3 +281,49 @@ def test_watchlist_commands_validate_and_reactivate_symbols(tmp_path):
     assert "005930" in fake.sent[-1][1]
     assert handle_update(update("/watchlist_add ABC"), path, fake, "42")
     assert "6자리" in fake.sent[-1][1]
+
+
+def test_watchlist_menu_add_prompt_and_symbol_remove_callbacks(tmp_path):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    with connect_database(path) as database:
+        database.init_schema()
+        database.add_watchlist_symbol("005930")
+        database.add_watchlist_symbol("000660")
+
+    menu_update = {"callback_query": {
+        "id": "watchlist-menu",
+        "from": {"id": 42},
+        "data": "control:watchlist",
+        "message": {"chat": {"id": 42, "type": "private"}},
+    }}
+    assert handle_update(menu_update, path, fake, "42")
+    markup = fake.sent[-1][2]
+    callbacks = [
+        button["callback_data"]
+        for row in markup["inline_keyboard"]
+        for button in row
+    ]
+    assert "watchlist:add" in callbacks
+    assert "watchlist:remove:005930" in callbacks
+
+    add_update = {"callback_query": {
+        "id": "watchlist-add",
+        "from": {"id": 42},
+        "data": "watchlist:add",
+        "message": {"chat": {"id": 42, "type": "private"}},
+    }}
+    assert handle_update(add_update, path, fake, "42")
+    assert "/watchlist_add 005930" in fake.sent[-1][1]
+
+    remove_update = {"callback_query": {
+        "id": "watchlist-remove",
+        "from": {"id": 42},
+        "data": "watchlist:remove:005930",
+        "message": {"chat": {"id": 42, "type": "private"}},
+    }}
+    assert handle_update(remove_update, path, fake, "42")
+    assert "관심종목 제거: 005930" in fake.sent[-1][1]
+    with connect_database(path) as database:
+        database.init_schema()
+        assert database.list_watchlist_symbols() == ["000660"]

@@ -152,7 +152,7 @@ TRADING_MENU_KEYBOARD = {
             {"text": "승인 대기", "callback_data": "control:approvals"},
         ],
         [
-            {"text": "관심종목", "callback_data": "control:watchlist"},
+            {"text": "관심종목 관리", "callback_data": "control:watchlist"},
             {"text": "최근 AI 판단", "callback_data": "control:decisions"},
         ],
         [{"text": "메인 메뉴", "callback_data": "menu:main"}],
@@ -415,6 +415,40 @@ def _watchlist_text(db_path: str) -> str:
         database.init_schema()
         symbols = database.list_watchlist_symbols()
     return "관심종목\n" + ("\n".join(symbols) if symbols else "none")
+
+
+def _watchlist_keyboard(db_path: str) -> dict[str, Any]:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        symbols = database.list_watchlist_symbols()
+    rows: list[list[dict[str, str]]] = [
+        [{"text": "추가", "callback_data": "watchlist:add"}],
+    ]
+    rows.extend(
+        [{"text": f"{symbol} 삭제", "callback_data": f"watchlist:remove:{symbol}"}]
+        for symbol in symbols
+    )
+    rows.append([{"text": "계좌·거래", "callback_data": "menu:trading"}])
+    rows.append([{"text": "메인 메뉴", "callback_data": "menu:main"}])
+    return {"inline_keyboard": rows}
+
+
+def _watchlist_add_prompt_text(db_path: str) -> str:
+    return (
+        _watchlist_text(db_path)
+        + "\n\n추가할 종목코드를 메시지로 보내세요.\n"
+        + "예: /watchlist_add 005930,000660"
+    )
+
+
+def _watchlist_remove_symbol_text(db_path: str, symbol: str) -> str:
+    if not symbol.isdigit() or len(symbol) != 6:
+        return "잘못된 종목코드: " + symbol + " (6자리 숫자 필요)"
+    with connect_database(db_path) as database:
+        database.init_schema()
+        changed = database.set_watchlist_enabled(symbol, False)
+        current = database.list_watchlist_symbols()
+    return f"관심종목 제거: {symbol if changed else '변경 없음'}\n현재: {','.join(current) or 'none'}"
 
 
 def _symbols_argument(command: tuple[str, str | int, str | int | None] | None) -> list[str]:
@@ -718,6 +752,7 @@ def _callback(
         data.startswith("control:")
         or data.startswith("approval:")
         or data.startswith("menu:")
+        or data.startswith("watchlist:")
     ):
         return None
     message_id = message.get("message_id")
@@ -759,6 +794,7 @@ def _default_keyboard(command_name: str) -> dict[str, Any]:
     if command_name in {
         "/watchlist", "watchlist", "/watchlist-add", "watchlist-add", "/watchlist-remove", "watchlist-remove",
         "/watchlist_add", "watchlist_add", "/watchlist_remove", "watchlist_remove",
+        "/watchlist:add", "/watchlist:remove",
     }:
         return TRADING_MENU_KEYBOARD
     return MAIN_MENU_KEYBOARD
@@ -783,6 +819,8 @@ def handle_update(
         if action.startswith("approval:"):
             command_name = "/approval-callback"
         elif action.startswith("menu:"):
+            command_name = "/" + action
+        elif action.startswith("watchlist:"):
             command_name = "/" + action
         else:
             command_name = "/" + action.split(":", 1)[1]
@@ -813,8 +851,16 @@ def handle_update(
         text, _ = _readiness(db_path)
     elif command_name == "/watchlist":
         text = _watchlist_text(db_path)
+        reply_markup = _watchlist_keyboard(db_path)
+    elif command_name == "/watchlist:add":
+        text = _watchlist_add_prompt_text(db_path)
+        reply_markup = _watchlist_keyboard(db_path)
+    elif command_name.startswith("/watchlist:remove:"):
+        text = _watchlist_remove_symbol_text(db_path, command_name.rsplit(":", 1)[1])
+        reply_markup = _watchlist_keyboard(db_path)
     elif command_name in {"/watchlist-add", "/watchlist-remove", "/watchlist_add", "/watchlist_remove"}:
         text = _watchlist_change_text(db_path, command, add=command_name in {"/watchlist-add", "/watchlist_add"})
+        reply_markup = _watchlist_keyboard(db_path)
     elif command_name == "/decisions":
         text = _decisions_text(db_path)
     elif command_name == "/approval-callback":
