@@ -147,6 +147,26 @@ def test_paused_state_still_reconciles(tmp_path, monkeypatch):
     assert calls == ["reconcile"]
 
 
+def test_one_iteration_reuses_one_broker_snapshot_for_reconcile_cancel_and_stale(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    seed_acknowledged_buy(path, now)
+    client = FakeOrderClient((broker_buy(),))
+
+    result = supervisor.one_iteration(
+        "config/settings.yaml",
+        path,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (client, FakeAccountClient()),
+        now=now,
+        buy_ttl_seconds=3600,
+        sell_ttl_seconds=3600,
+    )
+
+    assert result.ok
+    assert client.get_orders_calls == 1
+    assert client.cancel_calls == [("broker-1", "001", {"quantity": 10, "order_price": 100})]
+
+
 def test_normal_reconciled_is_silent_on_start_and_repeated_passes(tmp_path, monkeypatch):
     path, now = make_db(tmp_path)
     monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: noop_reconciliation())
@@ -169,6 +189,58 @@ def test_normal_reconciled_is_silent_on_start_and_repeated_passes(tmp_path, monk
         payload = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
     assert payload["status"] == "reconciled"
     assert payload["reasons"] == []
+
+
+def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: type(
+        "Reconciliation", (), {
+            "operator_review": True,
+            "block_new_entries": True,
+            "reasons": ("order_status_unavailable:KisHttpError:http_200:rt_cd_-1:msg_cd_EGW00123",),
+        },
+    )())
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
+    messages = []
+    state = supervisor.SupervisorState()
+
+    result = supervisor.one_iteration(
+        "config/settings.yaml", path, notifier=messages.append, state=state,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+        now=now,
+    )
+
+    assert result.status == "dependency_unavailable"
+    with connect_database(path) as database:
+        payload = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
+    assert payload["status"] == "dependency_unavailable"
+    assert payload["failure_streak"] == 1
+    assert payload["healthy_streak"] == 0
+    assert payload["next_retry_seconds"] == 5
+    assert payload["safe_kis_error"] == {
+        "http_status": "200",
+        "rt_cd": "-1",
+        "msg_cd": "EGW00123",
+    }
+
+    reports = iter([noop_reconciliation(), noop_reconciliation(), noop_reconciliation()])
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: next(reports))
+    for offset in range(1, 4):
+        supervisor.one_iteration(
+            "config/settings.yaml", path, notifier=messages.append, state=state,
+            expected_owner_id="owner-1",
+            client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+            now=now + timedelta(seconds=offset),
+        )
+
+    with connect_database(path) as database:
+        assert database.get_runtime_metadata("operator_review") == "false"
+        assert database.get_runtime_metadata("block_new_entries") == "false"
+        recovered = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
+    assert recovered["status"] == "reconciled"
+    assert recovered["healthy_streak"] == 3
+    assert any("recovered" in message for message in messages)
 
 
 def test_operator_review_is_throttled_and_recovery_notifies_once(tmp_path, monkeypatch):

@@ -126,6 +126,27 @@ def test_http_error_uses_safe_kis_error_without_secret_in_message():
     assert "access-token" not in str(error.value)
 
 
+def test_business_error_on_http_200_raises_safe_kis_error():
+    session = FakeSession([
+        FakeResponse(
+            {
+                "rt_cd": "-1",
+                "msg_cd": "EGW00123",
+                "msg1": "order status denied for app-secret-key and access-token",
+            },
+            status_code=200,
+        )
+    ])
+    with pytest.raises(KisHttpError) as error:
+        client(session).get_orders("20260818")
+    assert error.value.status_code == 200
+    assert error.value.details["rt_cd"] == "-1"
+    assert error.value.details["msg_cd"] == "EGW00123"
+    assert "app-secret-key" not in str(error.value)
+    assert "access-token" not in str(error.value)
+    assert "order status denied" in error.value.details["msg1"]
+
+
 @pytest.mark.parametrize("price,tick", [(1999, 1), (2000, 5), (4999, 5), (5000, 10), (19999, 10), (20000, 50), (49999, 50), (50000, 100), (199999, 100), (200000, 500), (499999, 500), (500000, 1000)])
 def test_2026_krx_price_bands(price, tick):
     assert krx_tick_size(price) == tick

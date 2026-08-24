@@ -125,6 +125,7 @@ def test_normal_ai_buy_ack_does_not_open_local_position(tmp_path):
         symbol="005930",
         generated_at=OPEN_MARKET_TIME,
         action=AIDecisionAction.BUY,
+        strategy="PULLBACK_WATCH",
         confidence=0.9,
         entry_price=100_000,
         stop_loss_price=99_000,
@@ -163,11 +164,47 @@ def test_normal_ai_buy_ack_does_not_open_local_position(tmp_path):
     assert notifier.messages and "BUY acknowledged" in notifier.messages[0]
 
 
+def test_ai_buy_strategy_must_match_deterministic_candidate_and_is_audited(tmp_path):
+    decision = TradingAIDecision(
+        symbol="005930",
+        generated_at=OPEN_MARKET_TIME,
+        action=AIDecisionAction.BUY,
+        strategy="NOT_A_CANDIDATE",
+        model="gpt-test",
+        prompt_version="trade-decision-v2",
+        confidence=0.9,
+        entry_price=100_000,
+        stop_loss_price=99_000,
+        take_profit_price=101_500,
+        rationale="invalid strategy",
+    )
+    with connect_database(tmp_path / "auto.db") as database:
+        database.init_schema()
+        seed_bars(database)
+        report = run_auto_trade_cycle(
+            ["005930"],
+            database=database,
+            ai_client=FixedAI(decision),
+            submitter=FakeSubmitter(),
+            runtime_control=active_control(),
+            config=AutoTradeConfig(max_quantity=1),
+            confirm_auto_trade=True,
+            current_time=OPEN_MARKET_TIME,
+        )
+        audit = database.get_ai_decision_audit(decision.decision_id)
+
+    assert report.results[0].reason == "ai_strategy_not_in_candidates"
+    assert audit["strategy"] == "NOT_A_CANDIDATE"
+    assert audit["model"] == "gpt-test"
+    assert audit["prompt_version"] == "trade-decision-v2"
+
+
 def test_high_risk_ai_buy_requests_approval_without_order(tmp_path):
     decision = TradingAIDecision(
         symbol="005930",
         generated_at=OPEN_MARKET_TIME,
         action=AIDecisionAction.BUY,
+        strategy="PULLBACK_WATCH",
         confidence=0.85,
         entry_price=100_000,
         stop_loss_price=99_000,

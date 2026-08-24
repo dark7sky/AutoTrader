@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from kis_ai_scalper import cli
 from kis_ai_scalper.broker.kis_auth import KisAuthClient, KisHttpError, redact
 from kis_ai_scalper.broker.kis_endpoints import base_url
 from kis_ai_scalper.broker.kis_rest import KisRestClient
@@ -225,3 +226,29 @@ def test_http_403_body_becomes_safe_error_without_secrets():
     assert "EGW00123" in message
     assert app_key not in message
     assert app_secret not in message
+
+
+def test_broker_state_smoke_reads_orders_and_account_without_writes(monkeypatch, capsys):
+    calls = []
+
+    class Orders:
+        def get_today_orders(self):
+            calls.append("orders")
+            return []
+
+    class Account:
+        def get_snapshot(self):
+            calls.append("account")
+            return type("Snapshot", (), {"positions": (), "summary": type("Summary", (), {})()})()
+
+    monkeypatch.setattr(cli, "_broker_clients", lambda *a, **k: (Orders(), Account()))
+
+    assert cli.main([
+        "smoke-broker-state",
+        "--config", "config/settings.yaml",
+        "--env", "demo",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "KIS broker state smoke: OK" in output
+    assert "orders=0" in output
+    assert calls == ["orders", "account"]

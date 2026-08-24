@@ -270,6 +270,50 @@ def test_status_and_readiness_show_operator_review_reasons(tmp_path, monkeypatch
     assert "operator_review=true (reconciliation:position_mismatch)" in fake.sent[-1][1]
 
 
+def test_readiness_shows_supervisor_dependency_details(tmp_path, monkeypatch):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    _ready_demo_env(monkeypatch)
+    monkeypatch.setattr(telegram_module, "is_regular_market_open", lambda _: False)
+    _ready_demo_db(path)
+    with connect_database(path) as database:
+        database.set_runtime_metadata("operator_review", "true")
+        database.set_runtime_metadata("block_new_entries", "true")
+        database.set_runtime_metadata(
+            "order-supervisor.status",
+            (
+                '{"status":"dependency_unavailable","environment":"demo",'
+                '"failure_streak":2,"healthy_streak":0,"next_retry_seconds":10,'
+                '"safe_kis_error":{"http_status":"200","rt_cd":"-1","msg_cd":"EGW00123"},'
+                '"updated_at":"2026-08-25T06:59:00+00:00",'
+                '"reasons":["dependency:order_status_unavailable:KisHttpError:http_200:rt_cd_-1:msg_cd_EGW00123"]}'
+            ),
+        )
+
+    assert handle_update({"message": {"chat": {"id": 42}, "text": "/readiness"}}, path, fake, "42")
+    text = fake.sent[-1][1]
+    assert "order_supervisor_status=dependency_unavailable" in text
+    assert "failure_streak=2 healthy_streak=0 next_retry_seconds=10" in text
+    assert "safe_kis_error=http_200 rt_cd=-1 msg_cd=EGW00123" in text
+    assert "order_supervisor_status_age=" in text
+
+
+def test_performance_command_and_ai_menu_button(tmp_path):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
+
+    assert "performance" in {item["command"] for item in telegram_module.BOT_COMMANDS}
+    callbacks = [
+        button["callback_data"]
+        for row in telegram_module.AI_MENU_KEYBOARD["inline_keyboard"]
+        for button in row
+    ]
+    assert "control:performance" in callbacks
+    assert handle_update(update("/performance"), path, fake, "42")
+    assert "performance report" in fake.sent[-1][1]
+
+
 def test_watchlist_commands_validate_and_reactivate_symbols(tmp_path):
     path = str(tmp_path / "control.sqlite3")
     fake = FakeTelegram()
