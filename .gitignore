@@ -20,4 +20,3 @@ logs/
 *.sqlite3
 .idea/
 .vscode/
-.github/workflows/*.yml
