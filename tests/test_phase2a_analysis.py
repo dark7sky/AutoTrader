@@ -69,6 +69,20 @@ def test_near_breakout_momentum_candidate_is_actionable():
     )
 
 
+def test_short_history_near_breakout_can_be_actionable_after_restart():
+    closes = [100, 101, 102, 103, 104, 105, 106, 107.8, 107.9]
+    snapshot = build_feature_snapshot(make_bars(closes, [100] * 8 + [120]))
+    assert snapshot is not None
+    assert snapshot.ema20 is None
+
+    candidates = scan_candidates(snapshot)
+
+    assert any(
+        candidate.strategy == "MOMENTUM_CONTINUATION" and candidate.score >= 0.75
+        for candidate in candidates
+    )
+
+
 def test_no_signal_case():
     snapshot = build_feature_snapshot(make_bars([100] * 25, [100] * 25))
     assert snapshot is not None
