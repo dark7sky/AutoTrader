@@ -9,6 +9,7 @@ from kis_ai_scalper.ai.decision import (
     AIDecisionContext,
     AIRiskLevel,
     OpenAITradingDecisionClient,
+    RuleBasedAIClient,
     TradingAIDecision,
     trading_ai_decision_schema,
 )
@@ -76,6 +77,25 @@ def active_control():
 
 def test_default_daily_trade_cap_targets_two_to_three_entries():
     assert RiskConfig().max_trades_per_day == 3
+
+
+def test_rule_ai_buys_actionable_pullback_candidate():
+    decision = RuleBasedAIClient().decide(AIDecisionContext(
+        symbol="005930",
+        features={},
+        candidates=[{
+            "symbol": "005930",
+            "strategy": "PULLBACK_WATCH",
+            "score": 0.76,
+            "reason": "controlled pullback",
+            "features": {},
+        }],
+        latest_price=100_000,
+    ))
+
+    assert decision.action is AIDecisionAction.BUY
+    assert decision.strategy == "PULLBACK_WATCH"
+    assert decision.confidence == 0.76
 
 
 def test_watchlist_add_disable_and_list(tmp_path):

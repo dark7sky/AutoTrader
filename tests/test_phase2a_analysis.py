@@ -57,7 +57,7 @@ def test_pullback_and_breakout_candidates():
 
 
 def test_near_breakout_momentum_candidate_is_actionable():
-    closes = [100 + index for index in range(20)] + [118.9]
+    closes = [100 + index for index in range(20)] + [119.8]
     snapshot = build_feature_snapshot(make_bars(closes, [100] * 20 + [130]))
     assert snapshot is not None
 
