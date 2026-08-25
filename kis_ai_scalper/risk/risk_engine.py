@@ -21,7 +21,7 @@ def evaluate_order_intent(
         return RiskDecision(False, "daily_loss_limit_reached")
     if portfolio.consecutive_losses >= config.consecutive_loss_limit:
         return RiskDecision(False, "consecutive_loss_limit_reached")
-    if portfolio.trades_today >= config.max_trades_per_day:
+    if config.max_trades_per_day is not None and portfolio.trades_today >= config.max_trades_per_day:
         return RiskDecision(False, "max_trades_per_day_reached")
     if portfolio.orders_by_symbol.get(intent.symbol, 0) >= config.max_orders_per_symbol:
         return RiskDecision(False, "max_orders_per_symbol_reached")

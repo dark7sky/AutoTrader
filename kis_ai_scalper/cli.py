@@ -452,7 +452,7 @@ def _risk_config_from_env(db_path: str | None = None):
         max_positions=int(_env_number("MAX_POSITIONS", defaults.max_positions, integer=True, minimum=1)),
         max_daily_loss_pct=float(_env_number("MAX_DAILY_LOSS_PCT", defaults.max_daily_loss_pct, minimum=0, maximum=100)),
         consecutive_loss_limit=int(_env_number("CONSECUTIVE_LOSS_LIMIT", defaults.consecutive_loss_limit, integer=True, minimum=1)),
-        max_trades_per_day=int(_env_number("MAX_TRADES_PER_DAY", defaults.max_trades_per_day, integer=True, minimum=1)),
+        max_trades_per_day=None,
         max_orders_per_symbol=int(_env_number("MAX_ORDERS_PER_SYMBOL", defaults.max_orders_per_symbol, integer=True, minimum=1)),
         minimum_confidence=float(_env_number("AI_MIN_CONFIDENCE", defaults.minimum_confidence, minimum=0, maximum=1)),
     )
@@ -462,12 +462,10 @@ def _risk_config_from_env(db_path: str | None = None):
         database.init_schema()
         frequency = read_trade_frequency(
             database,
-            default_max_trades_per_day=config.max_trades_per_day,
             default_ai_min_confidence=config.minimum_confidence,
         )
     return replace(
         config,
-        max_trades_per_day=frequency.max_trades_per_day,
         minimum_confidence=frequency.ai_min_confidence,
     )
 

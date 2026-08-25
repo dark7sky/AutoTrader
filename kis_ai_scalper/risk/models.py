@@ -12,7 +12,7 @@ class RiskConfig:
     max_positions: int = 2
     max_daily_loss_pct: float = 1.0
     consecutive_loss_limit: int = 3
-    max_trades_per_day: int = 3
+    max_trades_per_day: int | None = None
     max_orders_per_symbol: int = 3
     minimum_confidence: float = 0.75
 
