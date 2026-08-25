@@ -70,10 +70,11 @@ def test_near_breakout_momentum_candidate_is_actionable():
 
 
 def test_short_history_near_breakout_can_be_actionable_after_restart():
-    closes = [100, 101, 102, 103, 104, 105, 106, 107.8, 107.9]
-    snapshot = build_feature_snapshot(make_bars(closes, [100] * 8 + [120]))
+    closes = [100, 101, 102, 103, 104, 105, 106, 107.8, 108.7]
+    snapshot = build_feature_snapshot(make_bars(closes, [100] * 8 + [60]))
     assert snapshot is not None
     assert snapshot.ema20 is None
+    assert snapshot.volume_ratio == 0.6
 
     candidates = scan_candidates(snapshot)
 
