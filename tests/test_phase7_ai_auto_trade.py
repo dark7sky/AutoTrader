@@ -15,6 +15,7 @@ from kis_ai_scalper.ai.decision import (
 from kis_ai_scalper.broker.kis_order import KisOrderResult, KisOrderSide, KisOrderType
 from kis_ai_scalper.market.tick import MarketTick, MinuteBar
 from kis_ai_scalper.pipeline.auto_trade import AutoTradeConfig, run_auto_trade_cycle
+from kis_ai_scalper.risk.models import RiskConfig
 from kis_ai_scalper.storage import connect_database
 from kis_ai_scalper.storage.database import RuntimeControl
 
@@ -71,6 +72,10 @@ class FakeNotifier:
 
 def active_control():
     return RuntimeControl(False, "2026-08-15T09:00:00+09:00", "test", "test")
+
+
+def test_default_daily_trade_cap_targets_two_to_three_entries():
+    assert RiskConfig().max_trades_per_day == 3
 
 
 def test_watchlist_add_disable_and_list(tmp_path):

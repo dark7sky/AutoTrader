@@ -44,12 +44,29 @@ def test_pullback_and_breakout_candidates():
     pullback = rising + [119]
     pullback_snapshot = build_feature_snapshot(make_bars(pullback, [100] * 20 + [120]))
     assert pullback_snapshot is not None
-    assert any(candidate.strategy == "PULLBACK_WATCH" for candidate in scan_candidates(pullback_snapshot))
+    pullback_candidates = scan_candidates(pullback_snapshot)
+    assert any(
+        candidate.strategy == "PULLBACK_WATCH" and candidate.score >= 0.75
+        for candidate in pullback_candidates
+    )
 
     breakout = rising + [121]
     breakout_snapshot = build_feature_snapshot(make_bars(breakout, [100] * 20 + [150]))
     assert breakout_snapshot is not None
     assert any(candidate.strategy == "BREAKOUT_WATCH" for candidate in scan_candidates(breakout_snapshot))
+
+
+def test_near_breakout_momentum_candidate_is_actionable():
+    closes = [100 + index for index in range(20)] + [118.9]
+    snapshot = build_feature_snapshot(make_bars(closes, [100] * 20 + [130]))
+    assert snapshot is not None
+
+    candidates = scan_candidates(snapshot)
+
+    assert any(
+        candidate.strategy == "MOMENTUM_CONTINUATION" and candidate.score >= 0.75
+        for candidate in candidates
+    )
 
 
 def test_no_signal_case():
