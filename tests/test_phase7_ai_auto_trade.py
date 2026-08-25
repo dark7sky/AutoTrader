@@ -76,8 +76,8 @@ def active_control():
     return RuntimeControl(False, "2026-08-15T09:00:00+09:00", "test", "test")
 
 
-def test_default_daily_trade_cap_targets_two_to_three_entries():
-    assert RiskConfig().max_trades_per_day == 3
+def test_default_risk_config_does_not_cap_daily_trade_count():
+    assert RiskConfig().max_trades_per_day is None
 
 
 def test_rule_ai_buys_actionable_pullback_candidate():

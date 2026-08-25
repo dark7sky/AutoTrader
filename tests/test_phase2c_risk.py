@@ -59,11 +59,16 @@ def test_rejects_each_portfolio_limit():
         (PortfolioState(current_exposure_krw=599_000), "max_total_exposure_reached"),
         (PortfolioState(daily_pnl_krw=-30_000), "daily_loss_limit_reached"),
         (PortfolioState(consecutive_losses=3), "consecutive_loss_limit_reached"),
-        (PortfolioState(trades_today=10), "max_trades_per_day_reached"),
         (PortfolioState(orders_by_symbol={"005930": 3}), "max_orders_per_symbol_reached"),
     ]
     for portfolio, reason in cases:
         assert evaluate_order_intent(config, portfolio, make_intent()).reason == reason
+
+
+def test_does_not_limit_entries_by_daily_trade_count():
+    decision = evaluate_order_intent(RiskConfig(), PortfolioState(trades_today=100), make_intent())
+    assert decision.approved is True
+    assert decision.reason == "approved"
 
 
 def test_approves_normal_intent_and_reports_max_loss():
