@@ -1739,6 +1739,7 @@ def auto_trade_cycle(
             confirm_auto_trade=True,
             notifier=notifier,
             current_time=cycle_time,
+            clock=kst_now,
             portfolio=None if portfolio is None else portfolio.portfolio,
             entry_budget_checker=(
                 None if buying_power_client is None else _entry_budget_checker(buying_power_client)
