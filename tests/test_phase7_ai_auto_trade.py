@@ -13,6 +13,7 @@ from kis_ai_scalper.ai.decision import (
     TradingAIDecision,
     trading_ai_decision_schema,
 )
+from kis_ai_scalper.broker.kis_market_rules import normalize_krx_limit_price, validate_risk_reward
 from kis_ai_scalper.broker.kis_order import KisOrderResult, KisOrderSide, KisOrderType
 from kis_ai_scalper.market.tick import MarketTick, MinuteBar
 from kis_ai_scalper.pipeline.auto_trade import AutoTradeConfig, run_auto_trade_cycle
@@ -96,6 +97,29 @@ def test_rule_ai_buys_actionable_pullback_candidate():
     assert decision.action is AIDecisionAction.BUY
     assert decision.strategy == "PULLBACK_WATCH"
     assert decision.confidence == 0.76
+
+
+def test_rule_ai_buy_prices_survive_krx_tick_risk_reward_validation():
+    decision = RuleBasedAIClient().decide(AIDecisionContext(
+        symbol="005930",
+        features={},
+        candidates=[{
+            "symbol": "005930",
+            "strategy": "MOMENTUM_CONTINUATION",
+            "score": 0.76,
+            "reason": "pressing high",
+            "features": {},
+        }],
+        latest_price=252_500,
+    ))
+
+    assert decision.action is AIDecisionAction.BUY
+    entry_price = normalize_krx_limit_price(decision.entry_price, "buy")
+    stop_loss_price = normalize_krx_limit_price(decision.stop_loss_price, "buy")
+    take_profit_price = normalize_krx_limit_price(decision.take_profit_price, "sell")
+
+    check = validate_risk_reward(entry_price, take_profit_price, stop_loss_price)
+    assert check.ratio >= 1.5
 
 
 def test_watchlist_add_disable_and_list(tmp_path):
