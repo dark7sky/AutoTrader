@@ -20,6 +20,18 @@ def scan_candidates(snapshot: BarFeatureSnapshot) -> list[CandidateSignal]:
     """Return zero or more deterministic candidates for a completed snapshot."""
     candidates: list[CandidateSignal] = []
     common = snapshot.as_dict()
+    long_trend_confirmed = (
+        snapshot.ema20 is not None
+        and snapshot.ema20_slope_pct is not None
+        and snapshot.ema20_slope_pct > 0
+        and snapshot.ema5 is not None
+        and snapshot.latest_close > snapshot.ema5 > snapshot.ema20
+    )
+    short_trend_confirmed = (
+        snapshot.ema20 is None
+        and snapshot.ema5 is not None
+        and snapshot.latest_close >= snapshot.ema5 * 0.999
+    )
     if (
         snapshot.ema20 is not None
         and snapshot.ema20_slope_pct is not None
@@ -43,15 +55,11 @@ def scan_candidates(snapshot: BarFeatureSnapshot) -> list[CandidateSignal]:
         and snapshot.latest_close < snapshot.high_n
         and snapshot.distance_from_high_pct is not None
         and -0.3 < snapshot.distance_from_high_pct <= 0
-        and snapshot.ema5 is not None
-        and snapshot.ema20 is not None
-        and snapshot.latest_close > snapshot.ema5 > snapshot.ema20
-        and snapshot.ema20_slope_pct is not None
-        and snapshot.ema20_slope_pct > 0
+        and (long_trend_confirmed or short_trend_confirmed)
         and snapshot.vwap is not None
         and snapshot.latest_close > snapshot.vwap
         and snapshot.volume_ratio is not None
-        and snapshot.volume_ratio >= 1.1
+        and snapshot.volume_ratio >= 0.6
     ):
         candidates.append(CandidateSignal(
             snapshot.symbol,

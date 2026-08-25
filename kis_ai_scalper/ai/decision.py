@@ -86,6 +86,11 @@ class TradingAIClient(Protocol):
 class RuleBasedAIClient:
     """Deterministic local stand-in for unit tests and API-key-free dry runs."""
 
+    def __init__(self, buy_threshold: float = 0.75) -> None:
+        if not 0 <= buy_threshold <= 1:
+            raise ValueError("buy_threshold must be between 0 and 1")
+        self.buy_threshold = buy_threshold
+
     def decide(self, context: AIDecisionContext) -> TradingAIDecision:
         best = max(
             context.candidates,
@@ -104,7 +109,7 @@ class RuleBasedAIClient:
                 risk_level=AIRiskLevel.LOW,
                 rationale="Existing position is managed by deterministic exits.",
             )
-        if score >= 0.75:
+        if score >= self.buy_threshold:
             entry = context.latest_price
             return TradingAIDecision(
                 symbol=context.symbol,
@@ -114,7 +119,7 @@ class RuleBasedAIClient:
                 prompt_version=AI_DECISION_PROMPT_VERSION,
                 confidence=min(0.95, score),
                 entry_price=entry,
-                stop_loss_price=round(entry * 0.99),
+                stop_loss_price=round(entry * 0.992),
                 take_profit_price=round(entry * 1.015),
                 max_holding_seconds=900,
                 risk_level=AIRiskLevel.NORMAL,

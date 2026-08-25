@@ -14,6 +14,11 @@ import requests
 from kis_ai_scalper.ops.control import set_environment, set_paused
 from kis_ai_scalper.ops.openai_usage import openai_cost_summary_from_env
 from kis_ai_scalper.ops.performance import performance_report_from_database
+from kis_ai_scalper.ops.trading_frequency import (
+    FREQUENCY_PRESETS,
+    apply_trade_frequency_preset,
+    read_trade_frequency,
+)
 from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.storage import connect_database
 from kis_ai_scalper.market.schedule import exchange_calendar_available, is_regular_market_open
@@ -113,6 +118,7 @@ BOT_COMMANDS = [
     {"command": "watchlist_remove", "description": "관심종목 제거"},
     {"command": "decisions", "description": "최근 AI 판단"},
     {"command": "performance", "description": "AI 성과"},
+    {"command": "frequency", "description": "거래 빈도 설정"},
     {"command": "status", "description": "서비스 상태"},
     {"command": "control", "description": "운용 제어"},
 ]
@@ -172,6 +178,7 @@ CONTROL_MENU_KEYBOARD = {
             {"text": "긴급 정지", "callback_data": "control:emergency-stop"},
             {"text": "긴급 정지 해제", "callback_data": "control:clear-emergency"},
         ],
+        [{"text": "거래 빈도", "callback_data": "control:frequency"}],
         [{"text": "메인 메뉴", "callback_data": "menu:main"}],
     ]
 }
@@ -301,6 +308,66 @@ def _emergency_stop_active(db_path: str) -> bool:
     return (_metadata(db_path, EMERGENCY_STOP_KEY) or "").lower() == "true"
 
 
+def _frequency_settings(db_path: str):
+    with connect_database(db_path) as database:
+        database.init_schema()
+        return read_trade_frequency(
+            database,
+            default_max_trades_per_day=int(os.getenv("MAX_TRADES_PER_DAY", "3")),
+            default_ai_min_confidence=float(os.getenv("AI_MIN_CONFIDENCE", "0.75")),
+        )
+
+
+def _frequency_keyboard() -> dict[str, Any]:
+    labels = {
+        "conservative": "보수",
+        "normal": "표준",
+        "aggressive": "적극",
+    }
+    return {
+        "inline_keyboard": [
+            [
+                {"text": labels[name], "callback_data": f"frequency:set:{name}"}
+                for name in ("conservative", "normal", "aggressive")
+            ],
+            [{"text": "운용 제어", "callback_data": "menu:control"}],
+            [{"text": "메인 메뉴", "callback_data": "menu:main"}],
+        ]
+    }
+
+
+def _frequency_text(db_path: str) -> str:
+    settings = _frequency_settings(db_path)
+    presets = "\n".join(
+        f"- {name}: max_trades_per_day={preset.max_trades_per_day} "
+        f"ai_min_confidence={preset.ai_min_confidence:.2f}"
+        for name, preset in FREQUENCY_PRESETS.items()
+    )
+    return (
+        "거래 빈도\n"
+        f"profile={settings.profile}\n"
+        f"max_trades_per_day={settings.max_trades_per_day}\n"
+        f"ai_min_confidence={settings.ai_min_confidence:.2f}\n"
+        "presets:\n"
+        f"{presets}"
+    )
+
+
+def _set_frequency_text(db_path: str, profile: str) -> str:
+    with connect_database(db_path) as database:
+        database.init_schema()
+        try:
+            settings = apply_trade_frequency_preset(database, profile)
+        except ValueError:
+            return "usage: /frequency conservative|normal|aggressive"
+    return (
+        "거래 빈도 설정 완료\n"
+        f"profile={settings.profile}\n"
+        f"max_trades_per_day={settings.max_trades_per_day}\n"
+        f"ai_min_confidence={settings.ai_min_confidence:.2f}"
+    )
+
+
 def _status_text(db_path: str) -> str:
     with connect_database(db_path) as database:
         database.init_schema()
@@ -317,6 +384,7 @@ def _status_text(db_path: str) -> str:
         block_entries = database.get_runtime_metadata("block_new_entries")
         emergency = database.get_runtime_metadata(EMERGENCY_STOP_KEY) or database.get_runtime_metadata("emergency_stop")
         cancel_open_buys = database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY)
+    frequency = _frequency_settings(db_path)
     state = "paused" if control.paused else "running"
     heartbeat_text, heartbeat_healthy = _heartbeat_status(heartbeat)
     fill_heartbeat_text, fill_healthy = _heartbeat_status(fill_heartbeat)
@@ -335,7 +403,10 @@ def _status_text(db_path: str) -> str:
         f"operator_review: {_safe_flag(operator_review)}\n"
         f"block_new_entries: {_safe_flag(block_entries)}\n"
         f"emergency_stop: {_safe_flag(emergency)}\n"
-        f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}"
+        f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}\n"
+        f"trade_frequency: profile={frequency.profile} "
+        f"max_trades_per_day={frequency.max_trades_per_day} "
+        f"ai_min_confidence={frequency.ai_min_confidence:.2f}"
     )
 
 
@@ -813,6 +884,7 @@ def _command(update: dict[str, Any]) -> tuple[str, str | int, str | int | None] 
     return command + (" " + argument if argument and command in {
         "/pause", "/resume", "/env", "/environment", "/confirm-real", "/approve", "/reject",
         "/watchlist-add", "/watchlist-remove", "/watchlist_add", "/watchlist_remove",
+        "/frequency",
     } else ""), chat_id, user_id
 
 
@@ -829,6 +901,7 @@ def _callback(
         or data.startswith("approval:")
         or data.startswith("menu:")
         or data.startswith("watchlist:")
+        or data.startswith("frequency:")
     ):
         return None
     message_id = message.get("message_id")
@@ -860,6 +933,11 @@ def _default_keyboard(command_name: str) -> dict[str, Any]:
         "/cancel-open-buys", "cancel-open-buys",
     }:
         return CONTROL_MENU_KEYBOARD
+    if command_name in {
+        "/frequency", "frequency",
+        "/frequency:set:conservative", "/frequency:set:normal", "/frequency:set:aggressive",
+    }:
+        return _frequency_keyboard()
     if command_name in {
         "/env", "env", "/environment", "environment", "/confirm-real", "confirm-real",
         "/environment:demo", "/environment:real",
@@ -897,6 +975,8 @@ def handle_update(
         elif action.startswith("menu:"):
             command_name = "/" + action
         elif action.startswith("watchlist:"):
+            command_name = "/" + action
+        elif action.startswith("frequency:"):
             command_name = "/" + action
         else:
             command_name = "/" + action.split(":", 1)[1]
@@ -937,6 +1017,13 @@ def handle_update(
     elif command_name in {"/watchlist-add", "/watchlist-remove", "/watchlist_add", "/watchlist_remove"}:
         text = _watchlist_change_text(db_path, command, add=command_name in {"/watchlist-add", "/watchlist_add"})
         reply_markup = _watchlist_keyboard(db_path)
+    elif command_name == "/frequency":
+        profile = command[0].split(" ", 1)[1].strip() if command and " " in command[0] else ""
+        text = _set_frequency_text(db_path, profile) if profile else _frequency_text(db_path)
+        reply_markup = _frequency_keyboard()
+    elif command_name.startswith("/frequency:set:"):
+        text = _set_frequency_text(db_path, command_name.rsplit(":", 1)[1])
+        reply_markup = _frequency_keyboard()
     elif command_name == "/decisions":
         text = _decisions_text(db_path)
     elif command_name == "/approval-callback":

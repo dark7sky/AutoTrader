@@ -70,6 +70,7 @@ from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.ops.control import control_status, set_paused
 from kis_ai_scalper.ops.openai_usage import openai_cost_summary_from_env
 from kis_ai_scalper.ops.telegram import TelegramClient, env_value, optional_env_value, poll_telegram
+from kis_ai_scalper.ops.trading_frequency import read_trade_frequency
 from kis_ai_scalper.ops.fill_notice_worker import run_fill_notice_worker
 from kis_ai_scalper.ops.order_supervisor import run_order_supervisor
 from kis_ai_scalper.ai.reliable import UsageBudget
@@ -441,9 +442,9 @@ def _env_number(name: str, default: float, *, integer: bool = False,
     return value
 
 
-def _risk_config_from_env():
+def _risk_config_from_env(db_path: str | None = None):
     defaults = RiskConfig()
-    return RiskConfig(
+    config = RiskConfig(
         allocated_krw=float(_env_number("AUTO_TRADE_ALLOCATED_KRW", defaults.allocated_krw, minimum=0.01)),
         risk_per_trade_pct=float(_env_number("RISK_PER_TRADE_PCT", defaults.risk_per_trade_pct, minimum=0.01, maximum=100)),
         max_position_pct=float(_env_number("MAX_POSITION_PCT", defaults.max_position_pct, minimum=0.01, maximum=100)),
@@ -455,10 +456,24 @@ def _risk_config_from_env():
         max_orders_per_symbol=int(_env_number("MAX_ORDERS_PER_SYMBOL", defaults.max_orders_per_symbol, integer=True, minimum=1)),
         minimum_confidence=float(_env_number("AI_MIN_CONFIDENCE", defaults.minimum_confidence, minimum=0, maximum=1)),
     )
+    if db_path is None:
+        return config
+    with connect_database(db_path) as database:
+        database.init_schema()
+        frequency = read_trade_frequency(
+            database,
+            default_max_trades_per_day=config.max_trades_per_day,
+            default_ai_min_confidence=config.minimum_confidence,
+        )
+    return replace(
+        config,
+        max_trades_per_day=frequency.max_trades_per_day,
+        minimum_confidence=frequency.ai_min_confidence,
+    )
 
 
-def _auto_trade_config_from_env(max_quantity: int) -> AutoTradeConfig:
-    risk = _risk_config_from_env()
+def _auto_trade_config_from_env(max_quantity: int, db_path: str | None = None) -> AutoTradeConfig:
+    risk = _risk_config_from_env(db_path)
     return AutoTradeConfig(
         risk=risk,
         max_quantity=max_quantity,
@@ -1686,6 +1701,7 @@ def auto_trade_cycle(
         )
     else:
         control = latest_control
+    auto_config = _auto_trade_config_from_env(max_quantity, db_path=db_path)
     # Collection can outlive the preflight time used for market-open checks.
     cycle_time = kst_now()
     order_client = KisOrderClient(
@@ -1715,7 +1731,7 @@ def auto_trade_cycle(
     ai_client = shared_ai_client
     if ai_client is None:
         if ai == "rule":
-            ai_client = RuleBasedAIClient()
+            ai_client = RuleBasedAIClient(buy_threshold=auto_config.min_confidence)
         else:
             ai_client = OpenAITradingDecisionClient(
                 env_value("OPENAI_API_KEY"),
@@ -1735,7 +1751,7 @@ def auto_trade_cycle(
             ai_client=ai_client,
             submitter=order_submitter,
             runtime_control=control,
-            config=_auto_trade_config_from_env(max_quantity),
+            config=auto_config,
             confirm_auto_trade=True,
             notifier=notifier,
             current_time=cycle_time,

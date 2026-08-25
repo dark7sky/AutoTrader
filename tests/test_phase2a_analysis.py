@@ -70,11 +70,27 @@ def test_near_breakout_momentum_candidate_is_actionable():
 
 
 def test_short_history_near_breakout_can_be_actionable_after_restart():
-    closes = [100, 101, 102, 103, 104, 105, 106, 107.8, 108.7]
-    snapshot = build_feature_snapshot(make_bars(closes, [100] * 8 + [60]))
+    start = datetime(2026, 8, 15, 9, 0)
+    closes = [248_000, 253_000, 250_000, 253_500, 253_500, 253_500, 253_500, 253_500, 252_750]
+    bars = [
+        MinuteBar(
+            "005930",
+            start + timedelta(minutes=index),
+            close,
+            253_500 if index < 8 else 253_000,
+            close - 500,
+            close,
+            100 if index < 8 else 60,
+        )
+        for index, close in enumerate(closes)
+    ]
+    snapshot = build_feature_snapshot(bars)
     assert snapshot is not None
     assert snapshot.ema20 is None
     assert snapshot.volume_ratio == 0.6
+    assert snapshot.ema5 is not None
+    assert snapshot.latest_close < snapshot.ema5
+    assert snapshot.latest_close / snapshot.ema5 > 0.999
 
     candidates = scan_candidates(snapshot)
 
