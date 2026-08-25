@@ -314,6 +314,38 @@ def test_performance_command_and_ai_menu_button(tmp_path):
     assert "performance report" in fake.sent[-1][1]
 
 
+def test_frequency_menu_and_callbacks_update_runtime_trade_cadence(tmp_path):
+    path = str(tmp_path / "control.sqlite3")
+    fake = FakeTelegram()
+    update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
+
+    assert "frequency" in {item["command"] for item in telegram_module.BOT_COMMANDS}
+    assert handle_update(update("/frequency"), path, fake, "42")
+    assert "거래 빈도" in fake.sent[-1][1]
+    callbacks = [
+        button["callback_data"]
+        for row in fake.sent[-1][2]["inline_keyboard"]
+        for button in row
+    ]
+    assert "frequency:set:aggressive" in callbacks
+
+    callback = {"callback_query": {
+        "id": "freq-aggressive",
+        "from": {"id": 42},
+        "data": "frequency:set:aggressive",
+        "message": {"chat": {"id": 42, "type": "private"}},
+    }}
+    assert handle_update(callback, path, fake, "42")
+    assert "profile=aggressive" in fake.sent[-1][1]
+    assert "max_trades_per_day=5" in fake.sent[-1][1]
+    assert "ai_min_confidence=0.70" in fake.sent[-1][1]
+    with connect_database(path) as database:
+        database.init_schema()
+        assert database.get_runtime_metadata("trade_frequency.profile") == "aggressive"
+        assert database.get_runtime_metadata("trade_frequency.max_trades_per_day") == "5"
+        assert database.get_runtime_metadata("trade_frequency.ai_min_confidence") == "0.70"
+
+
 def test_watchlist_commands_validate_and_reactivate_symbols(tmp_path):
     path = str(tmp_path / "control.sqlite3")
     fake = FakeTelegram()

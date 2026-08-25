@@ -27,6 +27,22 @@ def test_risk_environment_values_are_strictly_parsed(monkeypatch):
         cli._risk_config_from_env()
 
 
+def test_auto_trade_config_uses_runtime_frequency_overrides(tmp_path, monkeypatch):
+    db_path = tmp_path / "frequency.sqlite3"
+    monkeypatch.setenv("MAX_TRADES_PER_DAY", "10")
+    monkeypatch.setenv("AI_MIN_CONFIDENCE", "0.82")
+    with connect_database(db_path) as database:
+        database.init_schema()
+        database.set_runtime_metadata("trade_frequency.max_trades_per_day", "5")
+        database.set_runtime_metadata("trade_frequency.ai_min_confidence", "0.70")
+
+    config = cli._auto_trade_config_from_env(1, db_path=str(db_path))
+
+    assert config.risk.max_trades_per_day == 5
+    assert config.risk.minimum_confidence == 0.70
+    assert config.min_confidence == 0.70
+
+
 def test_standalone_cycle_blocks_environment_mismatch_before_auth(tmp_path, capsys):
     db_path = tmp_path / "runtime.sqlite3"
     with connect_database(db_path) as database:
