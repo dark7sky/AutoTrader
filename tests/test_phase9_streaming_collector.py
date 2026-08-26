@@ -44,6 +44,10 @@ class FakeSocket:
         return message
 
 
+class ConnectionClosedError(Exception):
+    pass
+
+
 class SocketFactory:
     def __init__(self, sockets):
         self.sockets = list(sockets)
@@ -126,6 +130,17 @@ def test_reconnect_uses_bounded_backoff_and_counts_reconnects():
     result = asyncio.run(collector(SocketFactory([first, second]), db, sleeper=sleeper, random_source=lambda: 1.0, reconnect_jitter=0.1).run(max_reconnects=1))
     assert result.health.reconnect_count == 1
     assert waits == [0.1]
+    assert result.ticks_saved == 1
+
+
+def test_connection_closed_error_reconnects_without_escaping_to_service_loop():
+    first = FakeSocket([ack(), ConnectionClosedError()])
+    second = FakeSocket([ack(), raw_tick("005930", "090002", 101, 1), ConnectionError()])
+    db = FakeDatabase()
+
+    result = asyncio.run(collector(SocketFactory([first, second]), db).run(max_reconnects=1))
+
+    assert result.health.reconnect_count == 1
     assert result.ticks_saved == 1
 
 
