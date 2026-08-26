@@ -24,6 +24,9 @@ from kis_ai_scalper.market.clock import KST, kst_today
 from kis_ai_scalper.market.completed_bars import materialize_completed_bars
 
 
+TRANSIENT_WEBSOCKET_CLOSES = {"ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"}
+
+
 @dataclass(frozen=True)
 class HealthSnapshot:
     acknowledged: bool
@@ -206,7 +209,7 @@ class StreamingCollector:
                     if not await self._sleep_until(self._backoff(reconnect_attempt), deadline, stop_event):
                         break
                 except Exception as exc:
-                    if exc.__class__.__name__ != "ConnectionClosed":
+                    if exc.__class__.__name__ not in TRANSIENT_WEBSOCKET_CLOSES:
                         raise
                     if reconnect_attempt >= max_reconnects:
                         break
