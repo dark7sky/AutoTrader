@@ -106,6 +106,7 @@ def test_service_passes_owner_to_supervisor_and_joins_workers(tmp_path, monkeypa
     assert len(worker_calls["order"]) == 1
     owner_id = worker_calls["order"][0]["expected_owner_id"]
     assert isinstance(owner_id, str) and owner_id
+    assert worker_calls["order"][0]["broker_read_throttle_seconds"] == 0.25
     assert worker_calls["fill"][0]["stop_event"].is_set()
     assert worker_calls["order"][0]["stop_event"].is_set()
     assert {name for name, _ in joins} == {"fill-notice", "order-supervisor"}

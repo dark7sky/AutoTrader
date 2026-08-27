@@ -42,7 +42,9 @@ LAST_ERROR_KEY = f"{SUPERVISOR_COMPONENT}.last_error"
 CANCEL_REQUEST_KEY = "operator.cancel_open_buys_requested"
 CANCEL_STATUS_KEY = "operator.cancel_open_buys_status"
 DEFAULT_NOTIFY_THROTTLE_SECONDS = 300.0
+DEFAULT_BROKER_READ_THROTTLE_SECONDS = 0.25
 RECOVERY_HEALTHY_ITERATIONS = 3
+KIS_RATE_LIMIT_MSG_CODES = frozenset({"EGW00201"})
 
 
 ClientFactory = Callable[..., Any]
@@ -73,6 +75,7 @@ class OrderSupervisorResult:
     cancel_errors: int = 0
     error: str | None = None
     auth_refresh_requested: bool = False
+    next_retry_seconds: int = 0
 
     @property
     def ok(self) -> bool:
@@ -157,10 +160,19 @@ def _safe_kis_error_from_reasons(reasons: list[str] | tuple[str, ...]) -> dict[s
     return None
 
 
-def _dependency_backoff_seconds(failure_streak: int) -> int:
+def _dependency_backoff_seconds(
+    failure_streak: int,
+    safe_kis_error: dict[str, str] | None = None,
+) -> int:
     if failure_streak <= 0:
         return 0
-    return min(60, 5 * (2 ** (failure_streak - 1)))
+    base_seconds = (
+        15
+        if safe_kis_error
+        and safe_kis_error.get("msg_cd") in KIS_RATE_LIMIT_MSG_CODES
+        else 5
+    )
+    return min(60, base_seconds * (2 ** (failure_streak - 1)))
 
 
 def _now() -> datetime:
@@ -551,11 +563,15 @@ def one_iteration(
     client_factory: ClientFactory | None = None,
     state: SupervisorState | None = None,
     now: datetime | None = None,
+    broker_read_throttle_seconds: float = DEFAULT_BROKER_READ_THROTTLE_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> OrderSupervisorResult:
     """Run one bounded pass; ``client_factory`` is injectable for unit tests."""
     del stop_event, interval_seconds
     if buy_ttl_seconds < 0 or sell_ttl_seconds < 0:
         raise ValueError("order TTLs must be non-negative")
+    if broker_read_throttle_seconds < 0:
+        raise ValueError("broker read throttle must be non-negative")
     state = state or SupervisorState()
     expected = _expected_owner(expected_owner_id, owner_id)
     current = (now or _now()).astimezone(timezone.utc)
@@ -592,6 +608,8 @@ def one_iteration(
             except Exception as exc:
                 broker_orders_error = exc
             if broker_orders_error is None:
+                if broker_read_throttle_seconds > 0:
+                    sleeper(broker_read_throttle_seconds)
                 try:
                     account_snapshot = account_client.get_snapshot()
                 except Exception as exc:
@@ -643,11 +661,14 @@ def one_iteration(
                 if dependency_unavailable
                 else "reconciled_operator_review" if review else "reconciled"
             )
+            safe_kis_error = _safe_kis_error_from_reasons(reasons)
             next_retry_seconds = (
-                _dependency_backoff_seconds(state.dependency_failure_streak)
+                _dependency_backoff_seconds(
+                    state.dependency_failure_streak,
+                    safe_kis_error=safe_kis_error,
+                )
                 if dependency_unavailable else 0
             )
-            safe_kis_error = _safe_kis_error_from_reasons(reasons)
             database.set_runtime_metadata(
                 "operator_review", "true" if review else "false", updated_at=current
             )
@@ -705,6 +726,7 @@ def one_iteration(
                 cancel_report.requested,
                 cancel_report.errors,
                 auth_refresh_requested=state.force_refresh,
+                next_retry_seconds=next_retry_seconds,
             )
     except Exception as exc:
         state.healthy_iterations = 0
@@ -737,11 +759,17 @@ def run_order_supervisor(
     expected_owner_id: str | None = None,
     owner_id: str | None = None,
     client_factory: ClientFactory | None = None,
+    broker_read_throttle_seconds: float = DEFAULT_BROKER_READ_THROTTLE_SECONDS,
 ) -> OrderSupervisorResult | None:
     """Daemon-thread entry point with bounded, interruptible retry backoff."""
     if not isinstance(stop_event, threading.Event):
         raise TypeError("stop_event must be threading.Event")
-    if interval_seconds <= 0 or buy_ttl_seconds < 0 or sell_ttl_seconds < 0:
+    if (
+        interval_seconds <= 0
+        or buy_ttl_seconds < 0
+        or sell_ttl_seconds < 0
+        or broker_read_throttle_seconds < 0
+    ):
         raise ValueError("interval must be positive and TTLs must be non-negative")
     state = SupervisorState()
     backoff = 5.0
@@ -761,6 +789,7 @@ def run_order_supervisor(
             owner_id=owner_id,
             client_factory=client_factory,
             state=state,
+            broker_read_throttle_seconds=broker_read_throttle_seconds,
         )
         refresh_token = False
         if last.status == "lease_invalid":
@@ -768,9 +797,11 @@ def run_order_supervisor(
         if last.status in {"error", "dependency_unavailable"}:
             if last.auth_refresh_requested:
                 state.force_refresh = True
-            if stop_event.wait(min(backoff, 60.0)):
+            retry_seconds = float(last.next_retry_seconds or backoff)
+            if stop_event.wait(min(retry_seconds, 60.0)):
                 break
-            backoff = min(backoff * 2.0, 60.0)
+            if not last.next_retry_seconds:
+                backoff = min(backoff * 2.0, 60.0)
             continue
         backoff = 5.0
         remaining = max(0.0, interval_seconds - (time.monotonic() - started))

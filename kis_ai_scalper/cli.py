@@ -796,6 +796,11 @@ def service_loop(
                                 "sell_ttl_seconds": float(_env_number(
                                     "SELL_ORDER_TTL_SECONDS", 30, minimum=0,
                                 )),
+                                "broker_read_throttle_seconds": float(_env_number(
+                                    "ORDER_SUPERVISOR_BROKER_READ_THROTTLE_SECONDS",
+                                    0.25,
+                                    minimum=0,
+                                )),
                                 "expected_owner_id": owner_id,
                                 "refresh_token": refresh_token,
                             },
