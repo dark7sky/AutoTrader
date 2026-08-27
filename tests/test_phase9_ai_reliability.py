@@ -13,6 +13,10 @@ from kis_ai_scalper.ai.decision import (
     OpenAITradingDecisionClient,
 )
 from kis_ai_scalper.ai.reliable import UsageBudget
+from kis_ai_scalper.broker.kis_market_rules import (
+    normalize_krx_limit_price,
+    validate_risk_reward,
+)
 
 
 GOOD_CONTENT = (
@@ -82,6 +86,30 @@ def test_prompt_requires_executable_risk_reward_prices():
     assert "at least 0.5% below entry" in system_prompt
     assert "at least 1.5 times the per-share risk" in system_prompt
     assert decision.prompt_version == "trade-decision-v3"
+
+
+def test_buy_response_prices_are_normalized_to_executable_risk_plan():
+    content = (
+        '{"symbol":"005930","action":"BUY","strategy":"BREAKOUT_WATCH",'
+        '"confidence":0.8,"entry_price":267000,"take_profit_price":268500,'
+        '"stop_loss_price":265500,"max_holding_seconds":900,'
+        '"risk_level":"NORMAL","requires_operator_approval":false,'
+        '"rationale":"clear breakout"}'
+    )
+    response = FakeResponse({"choices": [{"message": {"content": content}}]})
+    client = OpenAITradingDecisionClient(
+        "key",
+        session=FakeSession([response]),
+    )
+
+    decision = client.decide(context())
+
+    entry = normalize_krx_limit_price(decision.entry_price, "buy")
+    stop = normalize_krx_limit_price(decision.stop_loss_price, "buy")
+    take = normalize_krx_limit_price(decision.take_profit_price, "sell")
+    check = validate_risk_reward(entry, take, stop)
+    assert check.stop_distance_pct >= 0.005
+    assert check.ratio >= 1.5
 
 
 def test_only_transient_failures_are_retried_with_bounded_backoff():
