@@ -11,6 +11,7 @@ import requests
 
 from .kis_auth import _raise_for_kis_response
 from .kis_endpoints import KisEnvironment, api_url
+from .kis_rate_limit import new_rate_limited_session
 
 
 ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
@@ -132,7 +133,7 @@ class KisOrderClient:
         self.access_token = access_token
         self.account_no = account_no
         self.account_product_code = account_product_code
-        self.session = session or requests.Session()
+        self.session = session or new_rate_limited_session(self.environment)
         self.timeout = timeout
         self.include_hashkey = include_hashkey
 

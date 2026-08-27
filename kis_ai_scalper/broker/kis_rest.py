@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from .kis_endpoints import KisEnvironment, api_url
+from .kis_rate_limit import new_rate_limited_session
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ class KisRestClient:
         self.app_key = app_key
         self.app_secret = app_secret
         self.access_token = access_token
-        self.session = session or requests.Session()
+        self.session = session or new_rate_limited_session(self.environment)
         self.timeout = timeout
 
     def get_current_price(self, symbol: str) -> CurrentPrice:

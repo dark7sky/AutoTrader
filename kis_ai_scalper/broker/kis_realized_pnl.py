@@ -9,6 +9,7 @@ import requests
 
 from .kis_auth import _raise_for_kis_response
 from .kis_endpoints import KisEnvironment, api_url
+from .kis_rate_limit import new_rate_limited_session
 
 
 REALIZED_PNL_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl"
@@ -103,7 +104,9 @@ class KisRealizedPnlClient:
         self.access_token = access_token
         self.account_no = account_no
         self.account_product_code = account_product_code
-        self.session = session if session is not None else requests.Session()
+        self.session = (
+            session if session is not None else new_rate_limited_session(self.environment)
+        )
         self.timeout = timeout
         self.max_pages = min(max_pages, 10)
 
