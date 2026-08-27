@@ -453,7 +453,7 @@ def trading_ai_decision_schema() -> dict[str, Any]:
     }
 
 
-AI_DECISION_PROMPT_VERSION = "trade-decision-v2"
+AI_DECISION_PROMPT_VERSION = "trade-decision-v3"
 
 
 _SYSTEM_PROMPT = (
@@ -461,7 +461,9 @@ _SYSTEM_PROMPT = (
     "Return only the requested JSON schema. Prefer HOLD unless the setup is clear. "
     "For BUY, set strategy to one of the provided deterministic candidate strategy values. "
     "For BUY, provide a limit entry near the latest price, take-profit above entry, "
-    "stop-loss below entry, and a short max holding time. Mark HIGH risk or "
+    "and stop-loss at least 0.5% below entry. The take-profit reward must be "
+    "at least 1.5 times the per-share risk after KRX tick-size rounding, so leave "
+    "a conservative rounding buffer. Use a short max holding time. Mark HIGH risk or "
     "requires_operator_approval when volatility, weak confidence, or ambiguous data "
     "makes automatic entry inappropriate. Never ask questions."
 )
