@@ -16,6 +16,10 @@ import requests
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kis_ai_scalper.market.features import BarFeatureSnapshot
+from kis_ai_scalper.broker.kis_market_rules import (
+    normalize_krx_limit_price,
+    validate_risk_reward,
+)
 from .reliable import AIBudgetExceededError, AIUsage, UsageBudget
 
 
@@ -285,6 +289,7 @@ class OpenAITradingDecisionClient:
                         "prompt_version": decision.prompt_version or AI_DECISION_PROMPT_VERSION,
                     }
                 )
+                decision = _normalize_buy_risk_plan(decision)
                 if decision.symbol != context.symbol:
                     raise AIDecisionResponseError(
                         f"OpenAI response symbol mismatch: expected {context.symbol}, got {decision.symbol}"
@@ -414,6 +419,24 @@ def _model_cost_rates(model: str) -> tuple[float, float]:
         "gpt-4o": (2.50, 10.00),
     }
     return rates.get(model.lower(), (0.15, 0.60))
+
+
+def _normalize_buy_risk_plan(decision: TradingAIDecision) -> TradingAIDecision:
+    if decision.action is not AIDecisionAction.BUY:
+        return decision
+    assert decision.entry_price is not None
+    entry = normalize_krx_limit_price(decision.entry_price, "buy")
+    stop = normalize_krx_limit_price(entry * 0.992, "buy")
+    risk_per_share = entry - stop
+    take = normalize_krx_limit_price(entry + risk_per_share * 1.6, "sell")
+    validate_risk_reward(entry, take, stop)
+    return decision.model_copy(
+        update={
+            "entry_price": float(entry),
+            "stop_loss_price": float(stop),
+            "take_profit_price": float(take),
+        }
+    )
 
 
 class _RetryableHTTPError(RuntimeError):
