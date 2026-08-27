@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any, Callable
 
 import requests
@@ -15,6 +16,9 @@ KIS_REST_INTERVAL_SECONDS = {
     KisEnvironment.DEMO: 0.5,
     KisEnvironment.REAL: 0.05,
 }
+KIS_RATE_LIMIT_CODE = "EGW00201"
+KIS_RATE_LIMIT_COOLDOWN_SECONDS = 1.0
+KIS_READ_MAX_RETRIES = 2
 
 
 class KisRateLimiter:
@@ -30,6 +34,7 @@ class KisRateLimiter:
         self._sleeper = sleeper
         self._lock = threading.Lock()
         self._last_call_at: dict[KisEnvironment, float] = {}
+        self._not_before: dict[KisEnvironment, float] = {}
 
     def wait(self, environment: KisEnvironment | str) -> None:
         env = (
@@ -40,11 +45,43 @@ class KisRateLimiter:
         with self._lock:
             now = self._clock()
             previous = self._last_call_at.get(env)
-            if previous is not None:
-                remaining = KIS_REST_INTERVAL_SECONDS[env] - (now - previous)
-                if remaining > 0:
-                    self._sleeper(remaining)
+            interval_remaining = (
+                0.0
+                if previous is None
+                else KIS_REST_INTERVAL_SECONDS[env] - (now - previous)
+            )
+            cooldown_remaining = self._not_before.get(env, 0.0) - now
+            remaining = max(0.0, interval_remaining, cooldown_remaining)
+            if remaining > 0:
+                self._sleeper(remaining)
             self._last_call_at[env] = self._clock()
+
+    def penalize(
+        self,
+        environment: KisEnvironment | str,
+        seconds: float = KIS_RATE_LIMIT_COOLDOWN_SECONDS,
+    ) -> None:
+        env = (
+            KisEnvironment.parse(environment)
+            if isinstance(environment, str)
+            else environment
+        )
+        with self._lock:
+            self._not_before[env] = max(
+                self._not_before.get(env, 0.0),
+                self._clock() + seconds,
+            )
+
+
+def _is_rate_limited(response: Any) -> bool:
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        isinstance(payload, Mapping)
+        and str(payload.get("msg_cd", "")) == KIS_RATE_LIMIT_CODE
+    )
 
 
 class KisRateLimitedSession:
@@ -66,8 +103,13 @@ class KisRateLimitedSession:
         self._limiter = limiter or GLOBAL_KIS_RATE_LIMITER
 
     def get(self, url: str, **kwargs: Any) -> Any:
-        self._limiter.wait(self.environment)
-        return self._session.get(url, **kwargs)
+        for attempt in range(KIS_READ_MAX_RETRIES + 1):
+            self._limiter.wait(self.environment)
+            response = self._session.get(url, **kwargs)
+            if not _is_rate_limited(response) or attempt >= KIS_READ_MAX_RETRIES:
+                return response
+            self._limiter.penalize(self.environment)
+        raise AssertionError("unreachable")
 
     def post(self, url: str, **kwargs: Any) -> Any:
         self._limiter.wait(self.environment)
@@ -92,6 +134,9 @@ def new_rate_limited_session(
 
 __all__ = [
     "GLOBAL_KIS_RATE_LIMITER",
+    "KIS_RATE_LIMIT_CODE",
+    "KIS_RATE_LIMIT_COOLDOWN_SECONDS",
+    "KIS_READ_MAX_RETRIES",
     "KIS_REST_INTERVAL_SECONDS",
     "KisRateLimitedSession",
     "KisRateLimiter",
