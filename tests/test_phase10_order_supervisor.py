@@ -243,6 +243,75 @@ def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkey
     assert any("recovered" in message for message in messages)
 
 
+def test_successful_broker_reads_are_spaced_before_account_snapshot(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: noop_reconciliation())
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
+    sleeps = []
+
+    result = supervisor.one_iteration(
+        "config/settings.yaml",
+        path,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+        now=now,
+        broker_read_throttle_seconds=0.25,
+        sleeper=sleeps.append,
+    )
+
+    assert result.status == "reconciled"
+    assert sleeps == [0.25]
+
+
+def test_kis_rate_limit_dependency_uses_longer_initial_backoff(tmp_path, monkeypatch):
+    path, now = make_db(tmp_path)
+
+    class RateLimitedAccountClient:
+        def get_snapshot(self):
+            raise KisHttpError(
+                500,
+                {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과"},
+            )
+
+    def reconcile(*args, **kwargs):
+        assert isinstance(kwargs["account_snapshot_error"], KisHttpError)
+        return type(
+            "Reconciliation",
+            (),
+            {
+                "operator_review": True,
+                "block_new_entries": True,
+                "reasons": (
+                    "account_snapshot_unavailable:KisHttpError:http_500:rt_cd_1:msg_cd_EGW00201",
+                ),
+            },
+        )()
+
+    monkeypatch.setattr(supervisor, "reconcile_broker_state", reconcile)
+    monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
+
+    result = supervisor.one_iteration(
+        "config/settings.yaml",
+        path,
+        expected_owner_id="owner-1",
+        client_factory=lambda environment, refresh_token=False: (
+            FakeOrderClient(),
+            RateLimitedAccountClient(),
+        ),
+        now=now,
+    )
+
+    assert result.status == "dependency_unavailable"
+    with connect_database(path) as database:
+        payload = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
+    assert payload["next_retry_seconds"] == 15
+    assert payload["safe_kis_error"] == {
+        "http_status": "500",
+        "rt_cd": "1",
+        "msg_cd": "EGW00201",
+    }
+
+
 def test_operator_review_is_throttled_and_recovery_notifies_once(tmp_path, monkeypatch):
     path, now = make_db(tmp_path)
     reports = iter([
