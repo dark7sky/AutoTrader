@@ -270,7 +270,7 @@ def test_kis_rate_limit_dependency_uses_longer_initial_backoff(tmp_path, monkeyp
         def get_snapshot(self):
             raise KisHttpError(
                 500,
-                {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과"},
+                {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "rate limit"},
             )
 
     def reconcile(*args, **kwargs):
@@ -545,6 +545,28 @@ def test_retry_backoff_is_capped_and_interruptible(monkeypatch):
     finally:
         monkeypatch.setattr(threading.Event, "wait", original_wait)
     assert waits == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0, 60.0]
+
+
+def test_dependency_result_retry_delay_is_used_by_worker(monkeypatch):
+    waits = []
+    event = threading.Event()
+    result = supervisor.OrderSupervisorResult(
+        "dependency_unavailable",
+        next_retry_seconds=15,
+    )
+
+    monkeypatch.setattr(supervisor, "one_iteration", lambda *args, **kwargs: result)
+
+    def fake_wait(timeout=None):
+        waits.append(timeout)
+        event.set()
+        return True
+
+    monkeypatch.setattr(event, "wait", fake_wait)
+
+    supervisor.run_order_supervisor("config/settings.yaml", "db.sqlite3", event)
+
+    assert waits == [15.0]
 
 
 def test_stop_event_interrupts_long_interval():
