@@ -16,6 +16,7 @@ from kis_ai_scalper.ai.decision import (
 from kis_ai_scalper.broker.kis_order import KisOrderRequest, KisOrderResult, KisOrderSide
 from kis_ai_scalper.market.features import build_feature_snapshot
 from kis_ai_scalper.market.clock import kst_now
+from kis_ai_scalper.market.tick import MinuteBar
 from kis_ai_scalper.market.schedule import (
     as_kst,
     is_forced_exit_window,
@@ -255,6 +256,22 @@ def _maybe_exit_position(
     )
 
 
+def _latest_contiguous_session_bars(bars: list[MinuteBar]) -> list[MinuteBar]:
+    if not bars:
+        return []
+    latest_day = as_kst(bars[-1].start).date()
+    contiguous = [bars[-1]]
+    expected = as_kst(bars[-1].start) - timedelta(minutes=1)
+    for bar in reversed(bars[:-1]):
+        start = as_kst(bar.start)
+        if start.date() != latest_day or start != expected:
+            break
+        contiguous.append(bar)
+        expected -= timedelta(minutes=1)
+    contiguous.reverse()
+    return contiguous
+
+
 def _maybe_enter_position(
     symbol: str,
     database: Database,
@@ -270,7 +287,7 @@ def _maybe_enter_position(
     cycle_deadline: datetime | None,
     post_ai_price_checker: Callable[[str], float] | None,
 ) -> AutoTradeSymbolResult:
-    bars = database.load_bars(symbol, limit=120)
+    bars = _latest_contiguous_session_bars(database.load_bars(symbol, limit=120))
     snapshot = build_feature_snapshot(bars)
     if snapshot is None:
         return _blocked(symbol, "missing_bars")
