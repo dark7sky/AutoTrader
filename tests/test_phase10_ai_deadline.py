@@ -112,6 +112,40 @@ def test_empty_deterministic_scan_blocks_openai_before_http_call(tmp_path):
     assert session.posts == 0
 
 
+def test_previous_session_bars_do_not_create_current_session_candidate(tmp_path):
+    session = Session()
+    ai = OpenAITradingDecisionClient("test-key", session=session, max_retries=0)
+    with connect_database(tmp_path / "cross-session-candidate.db") as database:
+        database.init_schema()
+        previous_session = NOW - timedelta(days=1, minutes=21)
+        for index in range(20):
+            close = 100_000 + index * 1_000
+            database.save_bar(MinuteBar(
+                "005930",
+                previous_session + timedelta(minutes=index),
+                close,
+                close + 500,
+                close - 500,
+                close,
+                100,
+            ))
+        database.save_bar(MinuteBar(
+            "005930",
+            NOW - timedelta(minutes=1),
+            121_000,
+            121_500,
+            120_500,
+            121_000,
+            150,
+        ))
+        database.save_tick(MarketTick("005930", NOW, 121_000, 1))
+
+        report = run(database, ai)
+
+    assert report.results[0].reason == "no_deterministic_candidate"
+    assert session.posts == 0
+
+
 def test_old_ai_response_is_blocked_before_order(tmp_path):
     ai = CountingAI(lambda symbol: buy_decision(symbol, generated_at=NOW - timedelta(seconds=6)))
     submitter = Submitter()
