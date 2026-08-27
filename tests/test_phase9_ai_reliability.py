@@ -72,6 +72,18 @@ def test_model_timeout_and_usage_are_injected_and_extracted(monkeypatch):
     assert client.total_usage.total_tokens == 120
 
 
+def test_prompt_requires_executable_risk_reward_prices():
+    session = FakeSession([FakeResponse()])
+    client = OpenAITradingDecisionClient("key", session=session)
+
+    decision = client.decide(context())
+
+    system_prompt = session.posts[0][1]["json"]["messages"][0]["content"]
+    assert "at least 0.5% below entry" in system_prompt
+    assert "at least 1.5 times the per-share risk" in system_prompt
+    assert decision.prompt_version == "trade-decision-v3"
+
+
 def test_only_transient_failures_are_retried_with_bounded_backoff():
     session = FakeSession([
         FakeResponse(status_code=429),
