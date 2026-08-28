@@ -766,7 +766,18 @@ def service_loop(
                         )
                         _sleep_remaining(started, cycle_interval_seconds)
                         continue
-                    if fill_notice_thread is None or not fill_notice_thread.is_alive():
+                    if collect_seconds > 0:
+                        lease_database.record_heartbeat("fill-notice", heartbeat_at=now)
+                        lease_database.set_runtime_metadata(
+                            "fill-notice:status", "rest_reconciliation", updated_at=now,
+                        )
+                        lease_database.set_runtime_metadata(
+                            "fill-notice:environment", env.value, updated_at=now,
+                        )
+                        lease_database.set_runtime_metadata(
+                            "fill-notice:last_error", "", updated_at=now,
+                        )
+                    elif fill_notice_thread is None or not fill_notice_thread.is_alive():
                         fill_notice_thread = threading.Thread(
                             target=run_fill_notice_worker,
                             kwargs={
