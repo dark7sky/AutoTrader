@@ -162,11 +162,17 @@ def smoke_ws(config_path: str, environment: str, symbol: str, seconds: int,
     ticks = ws_result.ticks
     first = f"{ticks[0].price:g}" if ticks else "none"
     last = f"{ticks[-1].price:g}" if ticks else "none"
-    print("KIS WebSocket smoke: OK")
+    succeeded = ws_result.acknowledged
+    print("KIS WebSocket smoke: OK" if succeeded else "KIS WebSocket smoke: FAILED")
     print(f"environment={env.value} symbol={symbol} ws_url={websocket_url(env)}")
-    print(f"cache_hit={str(result.cache_hit).lower()} subscribe_ack={str(ws_result.acknowledged).lower()} tick_count={len(ticks)} first_price={first} last_price={last}")
+    print(
+        f"cache_hit={str(result.cache_hit).lower()} "
+        f"subscribe_ack={str(ws_result.acknowledged).lower()} tick_count={len(ticks)} "
+        f"first_price={first} last_price={last} "
+        f"error_code={ws_result.error_code or 'none'}"
+    )
     print("orders=none account_queries=none execution_notices=none")
-    return 0
+    return 0 if succeeded else 3
 
 
 def smoke_fill_notice(

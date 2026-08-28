@@ -37,6 +37,7 @@ def realtime_price_to_market_tick(price: RealtimePrice, trading_date: date) -> M
 class WebSocketSmokeResult:
     acknowledged: bool
     ticks: tuple[RealtimePrice, ...]
+    error_code: str | None = None
 
 
 def build_subscription(approval_key: str, symbol: str, tr_id: str = TR_REALTIME_PRICE) -> str:
@@ -96,6 +97,18 @@ def is_subscription_ack(message: dict[str, Any] | None) -> bool:
     return "SUBSCRIBE SUCCESS" in text or "SUBSCRIBE SUCCESS" in text.replace("_", " ")
 
 
+def _subscription_error_code(message: dict[str, Any] | None) -> str | None:
+    if not message:
+        return None
+    body = message.get("body", {})
+    if not isinstance(body, dict) or str(body.get("rt_cd", "0")) in {"", "0"}:
+        return None
+    code = str(body.get("msg_cd") or "websocket_rejected")
+    if len(code) > 40 or not code.replace("_", "").replace("-", "").isalnum():
+        return "websocket_rejected"
+    return code
+
+
 def parse_realtime_price(raw: str | bytes) -> RealtimePrice | None:
     """Parse KIS 0|H0STCNT0|count|symbol^time^price^... payload."""
     text = raw_to_text(raw).strip()
@@ -136,6 +149,7 @@ async def smoke_realtime_price(
 
     ticks: list[RealtimePrice] = []
     acknowledged = False
+    error_code: str | None = None
     deadline = time.monotonic() + seconds
     async with websockets.connect(endpoint, open_timeout=15, close_timeout=5) as socket:
         await socket.send(build_subscription(approval_key, symbol))
@@ -143,16 +157,29 @@ async def smoke_realtime_price(
             remaining = max(0.05, deadline - time.monotonic())
             try:
                 raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
-            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+            except asyncio.TimeoutError:
+                break
+            except websockets.exceptions.ConnectionClosed:
+                error_code = "connection_closed"
                 break
             system = parse_system_message(raw)
             if is_pingpong(system):
                 await socket.send(raw_to_text(raw))
                 continue
+            rejection = _subscription_error_code(system)
+            if rejection is not None:
+                error_code = rejection
+                break
             if is_subscription_ack(system):
                 acknowledged = True
                 continue
             tick = parse_realtime_price(raw)
             if tick is not None and tick.symbol == symbol:
                 ticks.append(tick)
-    return WebSocketSmokeResult(acknowledged=acknowledged, ticks=tuple(ticks))
+    if not acknowledged and error_code is None:
+        error_code = "subscription_not_acknowledged"
+    return WebSocketSmokeResult(
+        acknowledged=acknowledged,
+        ticks=tuple(ticks),
+        error_code=error_code,
+    )
