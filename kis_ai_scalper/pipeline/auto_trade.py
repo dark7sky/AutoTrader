@@ -73,6 +73,7 @@ class AutoTradeSymbolResult:
 @dataclass(frozen=True)
 class AutoTradeCycleReport:
     results: tuple[AutoTradeSymbolResult, ...]
+    ai_call_count: int = 0
 
     @property
     def submitted_count(self) -> int:
@@ -125,6 +126,7 @@ def run_auto_trade_cycle(
         else cycle_started_at + timedelta(seconds=config.cycle_deadline_seconds)
     )
     results: list[AutoTradeSymbolResult] = []
+    ai_call_count = [0]
     open_position_symbols = [str(position["symbol"]) for position in database.list_open_live_positions()]
     symbols_to_process = list(dict.fromkeys([*symbols, *open_position_symbols]))
     for symbol in symbols_to_process:
@@ -170,13 +172,13 @@ def run_auto_trade_cycle(
                 _maybe_enter_position(
                     symbol, database, ai_client, submitter, config, now, notifier, portfolio,
                     entry_budget_checker, clock=now_provider, cycle_deadline=cycle_deadline,
-                    post_ai_price_checker=post_ai_price_checker,
+                    post_ai_price_checker=post_ai_price_checker, ai_call_count=ai_call_count,
                 )
             )
         except Exception as exc:
             results.append(_blocked(symbol, f"symbol_error:{type(exc).__name__}"))
             _notify(notifier, f"{symbol} cycle error: {type(exc).__name__}")
-    return AutoTradeCycleReport(tuple(results))
+    return AutoTradeCycleReport(tuple(results), ai_call_count=ai_call_count[0])
 
 
 def _maybe_exit_position(
@@ -286,6 +288,7 @@ def _maybe_enter_position(
     clock: Callable[[], datetime],
     cycle_deadline: datetime | None,
     post_ai_price_checker: Callable[[str], float] | None,
+    ai_call_count: list[int],
 ) -> AutoTradeSymbolResult:
     bars = _latest_contiguous_session_bars(database.load_bars(symbol, limit=120))
     snapshot = build_feature_snapshot(bars)
@@ -325,6 +328,7 @@ def _maybe_enter_position(
     pre_ai_tick = database.latest_tick(symbol)
     if pre_ai_tick is None:
         return _blocked(symbol, "stale_tick")
+    ai_call_count[0] += 1
     decision = ai_client.decide(
         context_from_snapshot(snapshot, [candidate.__dict__ for candidate in candidates])
     )

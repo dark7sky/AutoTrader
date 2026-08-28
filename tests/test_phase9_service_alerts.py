@@ -215,7 +215,7 @@ def test_auto_trade_uses_time_after_stream_collection(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "StreamingCollector", FakeCollector)
     monkeypatch.setattr(cli, "run_auto_trade_cycle", lambda *args, **kwargs: (
         captured.update(current_time=kwargs["current_time"])
-        or type("Report", (), {"submitted_count": 0, "results": ()})()
+        or type("Report", (), {"submitted_count": 0, "results": (), "ai_call_count": 0})()
     ))
 
     assert cli.auto_trade_cycle(

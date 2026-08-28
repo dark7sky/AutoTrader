@@ -1794,6 +1794,7 @@ def auto_trade_cycle(
                     "observed_at": cycle_time.isoformat(),
                     "environment": env.value,
                     "ai": ai,
+                    "ai_calls": report.ai_call_count,
                     "results": [
                         {
                             "symbol": result.symbol,
@@ -1818,7 +1819,7 @@ def auto_trade_cycle(
             f"symbol={result.symbol} action={result.action} submitted={str(result.submitted).lower()} "
             f"reason={result.reason} quantity={result.quantity} broker_order_id={result.broker_order_id or 'none'}"
         )
-    print(f"broker_orders={report.submitted_count} ai_calls={'0' if ai == 'rule' else len(symbols)}")
+    print(f"broker_orders={report.submitted_count} ai_calls={report.ai_call_count}")
     return 0
 
 

@@ -133,7 +133,7 @@ def test_cli_openai_client_receives_dotenv_model_and_budget_explicitly(tmp_path,
     monkeypatch.setattr(cli, "KisOrderClient", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli, "OpenAITradingDecisionClient", FakeAI)
     monkeypatch.setattr(cli, "run_auto_trade_cycle", lambda *args, **kwargs: type(
-        "Report", (), {"submitted_count": 0, "results": ()}
+        "Report", (), {"submitted_count": 0, "results": (), "ai_call_count": 0}
     )())
 
     captured = {}
