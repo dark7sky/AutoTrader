@@ -9,7 +9,9 @@ from kis_ai_scalper.risk.portfolio_snapshot import PortfolioRiskSnapshot
 from kis_ai_scalper.storage import connect_database
 
 
-def test_auto_trade_cycle_persists_last_cycle_observability_metadata(tmp_path, monkeypatch):
+def test_auto_trade_cycle_persists_last_cycle_observability_metadata(
+    tmp_path, monkeypatch, capsys,
+):
     db_path = tmp_path / "auto-trade.sqlite3"
     observed_at = datetime(2026, 8, 21, 10, 15, tzinfo=timezone.utc)
     report = AutoTradeCycleReport((
@@ -29,7 +31,7 @@ def test_auto_trade_cycle_persists_last_cycle_observability_metadata(tmp_path, m
             reason="operator_approval_required",
             quantity=0,
         ),
-    ))
+    ), ai_call_count=1)
 
     with connect_database(db_path) as database:
         database.init_schema()
@@ -73,6 +75,7 @@ def test_auto_trade_cycle_persists_last_cycle_observability_metadata(tmp_path, m
     )
 
     assert result == 0
+    assert "broker_orders=1 ai_calls=1" in capsys.readouterr().out
     with connect_database(db_path) as database:
         stored = database.get_runtime_metadata(cli.AUTO_TRADE_LAST_CYCLE_KEY)
 
@@ -80,6 +83,7 @@ def test_auto_trade_cycle_persists_last_cycle_observability_metadata(tmp_path, m
     payload = json.loads(stored)
     assert payload == {
         "ai": "rule",
+        "ai_calls": 1,
         "environment": "demo",
         "observed_at": observed_at.isoformat(),
         "results": [

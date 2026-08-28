@@ -109,6 +109,7 @@ def test_empty_deterministic_scan_blocks_openai_before_http_call(tmp_path):
         report = run(database, ai)
 
     assert report.results[0].reason == "no_deterministic_candidate"
+    assert report.ai_call_count == 0
     assert session.posts == 0
 
 

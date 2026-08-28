@@ -204,6 +204,7 @@ def test_normal_ai_buy_ack_does_not_open_local_position(tmp_path):
         ).fetchone()
 
     assert report.submitted_count == 1
+    assert report.ai_call_count == 1
     assert submitter.requests[0].side == KisOrderSide.BUY
     assert submitter.requests[0].quantity == 1
     assert positions == []
