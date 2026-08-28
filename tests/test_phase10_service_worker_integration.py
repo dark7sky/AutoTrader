@@ -112,6 +112,25 @@ def test_service_passes_owner_to_supervisor_and_joins_workers(tmp_path, monkeypa
     assert {name for name, _ in joins} == {"fill-notice", "order-supervisor"}
 
 
+def test_service_reserves_single_websocket_for_market_stream(tmp_path, monkeypatch):
+    config_path = tmp_path / "config" / "settings.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("{}\n", encoding="utf-8")
+    db_path = tmp_path / "service.sqlite3"
+    worker_calls = {"fill": [], "order": []}
+    _patch_service_dependencies(monkeypatch, preflight_errors=[], worker_calls=worker_calls)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.service_loop(
+            str(config_path), None, str(db_path), "rule", 1, 65, 1, 10, 0, True,
+        )
+
+    assert worker_calls["fill"] == []
+    assert len(worker_calls["order"]) == 1
+    with connect_database(str(db_path)) as database:
+        assert database.get_runtime_metadata("fill-notice:status") == "rest_reconciliation"
+
+
 def test_emergency_stop_pauses_and_requests_cancel_for_known_buy(tmp_path):
     path = tmp_path / "telegram.sqlite3"
     seed_acknowledged_buy(path)
