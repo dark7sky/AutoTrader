@@ -3,6 +3,7 @@ from datetime import datetime
 from datetime import date
 import pytest
 
+import kis_ai_scalper.cli as cli
 from kis_ai_scalper.broker.kis_endpoints import websocket_url
 from kis_ai_scalper.broker.kis_ws import (
     TR_REALTIME_PRICE,
@@ -13,6 +14,7 @@ from kis_ai_scalper.broker.kis_ws import (
     parse_system_message,
     realtime_price_to_market_tick,
     RealtimePrice,
+    WebSocketSmokeResult,
 )
 from kis_ai_scalper.market.bar_builder import MinuteBarBuilder
 from kis_ai_scalper.market.tick import MarketTick
@@ -67,3 +69,34 @@ def test_minute_bar_builder_is_deterministic():
 def test_cli_rejects_seconds_outside_bounded_smoke_window():
     with pytest.raises(ValueError, match="between 1 and 60"):
         smoke_ws("config/settings.yaml", "demo", "005930", 61)
+
+
+def test_cli_reports_rejected_subscription_as_failure(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "config" / "settings.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "load_config", lambda _path: type(
+        "Config", (), {
+            "kis_api_for": lambda self, _env: type(
+                "Api", (), {"app_key": "key", "app_secret": "secret"},
+            )(),
+        },
+    )())
+    monkeypatch.setattr(
+        cli.KisAuthClient,
+        "authenticate_read_only",
+        lambda self, **kwargs: type(
+            "Auth", (), {"approval_key": "approval", "cache_hit": True},
+        )(),
+    )
+
+    async def rejected(*args, **kwargs):
+        return WebSocketSmokeResult(False, (), error_code="OPSP8996")
+
+    monkeypatch.setattr(cli, "smoke_realtime_price", rejected)
+
+    assert cli.smoke_ws(str(config_path), "demo", "005930", 10) == 3
+    output = capsys.readouterr().out
+    assert "KIS WebSocket smoke: FAILED" in output
+    assert "error_code=OPSP8996" in output
