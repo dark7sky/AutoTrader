@@ -49,6 +49,7 @@ class AutoTradeConfig:
     risk: RiskConfig = RiskConfig()
     max_quantity: int = 1
     min_confidence: float = 0.75
+    candidate_profile: str = "normal"
     max_entry_deviation_pct: float = 1.0
     require_confirmation: bool = True
     enforce_market_hours: bool = True
@@ -316,7 +317,7 @@ def _maybe_enter_position(
     if database.get_broker_order(f"ai:buy:{signal_id}") is not None:
         return _blocked(symbol, "order_already_claimed")
 
-    candidates = scan_candidates(snapshot)
+    candidates = scan_candidates(snapshot, profile=config.candidate_profile)
     if not candidates and _is_network_decision_client(ai_client):
         return _blocked(symbol, "no_deterministic_candidate")
     pre_ai_now = _clock_now(clock)

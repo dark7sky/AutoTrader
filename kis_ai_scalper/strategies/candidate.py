@@ -16,8 +16,33 @@ class CandidateSignal:
     features: dict[str, object]
 
 
-def scan_candidates(snapshot: BarFeatureSnapshot) -> list[CandidateSignal]:
+@dataclass(frozen=True)
+class CandidateThresholds:
+    pullback_distance_min: float
+    pullback_distance_max: float
+    pullback_volume_ratio: float
+    momentum_distance_min: float
+    momentum_volume_ratio: float
+    breakout_volume_ratio: float
+
+
+CANDIDATE_PROFILES = {
+    "conservative": CandidateThresholds(-1.0, -0.4, 1.3, -0.2, 0.9, 1.5),
+    "normal": CandidateThresholds(-1.5, -0.3, 1.0, -0.3, 0.6, 1.2),
+    "aggressive": CandidateThresholds(-2.0, -0.15, 0.7, -0.5, 0.5, 0.9),
+}
+
+
+def scan_candidates(
+    snapshot: BarFeatureSnapshot,
+    *,
+    profile: str = "normal",
+) -> list[CandidateSignal]:
     """Return zero or more deterministic candidates for a completed snapshot."""
+    try:
+        thresholds = CANDIDATE_PROFILES[profile]
+    except KeyError as exc:
+        raise ValueError(f"unknown candidate profile: {profile}") from exc
     candidates: list[CandidateSignal] = []
     common = snapshot.as_dict()
     long_trend_confirmed = (
@@ -39,9 +64,11 @@ def scan_candidates(snapshot: BarFeatureSnapshot) -> list[CandidateSignal]:
         and snapshot.vwap is not None
         and snapshot.latest_close > snapshot.vwap
         and snapshot.distance_from_high_pct is not None
-        and -1.5 <= snapshot.distance_from_high_pct <= -0.3
+        and thresholds.pullback_distance_min
+        <= snapshot.distance_from_high_pct
+        <= thresholds.pullback_distance_max
         and snapshot.volume_ratio is not None
-        and snapshot.volume_ratio >= 1.0
+        and snapshot.volume_ratio >= thresholds.pullback_volume_ratio
     ):
         candidates.append(CandidateSignal(
             snapshot.symbol,
@@ -54,12 +81,12 @@ def scan_candidates(snapshot: BarFeatureSnapshot) -> list[CandidateSignal]:
         snapshot.high_n is not None
         and snapshot.latest_close < snapshot.high_n
         and snapshot.distance_from_high_pct is not None
-        and -0.3 < snapshot.distance_from_high_pct <= 0
+        and thresholds.momentum_distance_min < snapshot.distance_from_high_pct <= 0
         and (long_trend_confirmed or short_trend_confirmed)
         and snapshot.vwap is not None
         and snapshot.latest_close > snapshot.vwap
         and snapshot.volume_ratio is not None
-        and snapshot.volume_ratio >= 0.6
+        and snapshot.volume_ratio >= thresholds.momentum_volume_ratio
     ):
         candidates.append(CandidateSignal(
             snapshot.symbol,
@@ -74,7 +101,7 @@ def scan_candidates(snapshot: BarFeatureSnapshot) -> list[CandidateSignal]:
         and snapshot.vwap is not None
         and snapshot.latest_close > snapshot.vwap
         and snapshot.volume_ratio is not None
-        and snapshot.volume_ratio >= 1.2
+        and snapshot.volume_ratio >= thresholds.breakout_volume_ratio
     ):
         candidates.append(CandidateSignal(
             snapshot.symbol,

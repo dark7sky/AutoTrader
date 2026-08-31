@@ -478,10 +478,21 @@ def _risk_config_from_env(db_path: str | None = None):
 
 def _auto_trade_config_from_env(max_quantity: int, db_path: str | None = None) -> AutoTradeConfig:
     risk = _risk_config_from_env(db_path)
+    candidate_profile = "normal"
+    if db_path is not None:
+        with connect_database(db_path) as database:
+            database.init_schema()
+            frequency = read_trade_frequency(
+                database,
+                default_ai_min_confidence=risk.minimum_confidence,
+            )
+        if frequency.profile in {"conservative", "normal", "aggressive"}:
+            candidate_profile = frequency.profile
     return AutoTradeConfig(
         risk=risk,
         max_quantity=max_quantity,
         min_confidence=risk.minimum_confidence,
+        candidate_profile=candidate_profile,
         cycle_deadline_seconds=float(
             _env_number("AUTO_TRADE_DECISION_DEADLINE_SECONDS", 25, minimum=1)
         ),
@@ -773,15 +784,20 @@ def service_loop(
                         _sleep_remaining(started, cycle_interval_seconds)
                         continue
                     if collect_seconds > 0:
-                        lease_database.record_heartbeat("fill-notice", heartbeat_at=now)
-                        lease_database.set_runtime_metadata(
-                            "fill-notice:status", "rest_reconciliation", updated_at=now,
+                        fill_heartbeat_at = datetime.now(timezone.utc)
+                        lease_database.record_heartbeat(
+                            "fill-notice", heartbeat_at=fill_heartbeat_at,
                         )
                         lease_database.set_runtime_metadata(
-                            "fill-notice:environment", env.value, updated_at=now,
+                            "fill-notice:status", "rest_reconciliation",
+                            updated_at=fill_heartbeat_at,
                         )
                         lease_database.set_runtime_metadata(
-                            "fill-notice:last_error", "", updated_at=now,
+                            "fill-notice:environment", env.value,
+                            updated_at=fill_heartbeat_at,
+                        )
+                        lease_database.set_runtime_metadata(
+                            "fill-notice:last_error", "", updated_at=fill_heartbeat_at,
                         )
                     elif fill_notice_thread is None or not fill_notice_thread.is_alive():
                         fill_notice_thread = threading.Thread(

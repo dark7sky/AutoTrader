@@ -338,13 +338,15 @@ def _frequency_keyboard() -> dict[str, Any]:
 def _frequency_text(db_path: str) -> str:
     settings = _frequency_settings(db_path)
     presets = "\n".join(
-        f"- {name}: ai_min_confidence={preset.ai_min_confidence:.2f}"
+        f"- {name}: ai_min_confidence={preset.ai_min_confidence:.2f} "
+        f"candidate_sensitivity={name}"
         for name, preset in FREQUENCY_PRESETS.items()
     )
     return (
         "거래 빈도\n"
         f"profile={settings.profile}\n"
         f"ai_min_confidence={settings.ai_min_confidence:.2f}\n"
+        f"candidate_sensitivity={settings.profile}\n"
         "daily_trade_limit=none\n"
         "presets:\n"
         f"{presets}"
@@ -362,6 +364,7 @@ def _set_frequency_text(db_path: str, profile: str) -> str:
         "거래 빈도 설정 완료\n"
         f"profile={settings.profile}\n"
         f"ai_min_confidence={settings.ai_min_confidence:.2f}\n"
+        f"candidate_sensitivity={settings.profile}\n"
         "daily_trade_limit=none"
     )
 
@@ -404,6 +407,7 @@ def _status_text(db_path: str) -> str:
         f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}\n"
         f"trade_frequency: profile={frequency.profile} "
         f"ai_min_confidence={frequency.ai_min_confidence:.2f} "
+        f"candidate_sensitivity={frequency.profile} "
         "daily_trade_limit=none"
     )
 
