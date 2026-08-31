@@ -1,3 +1,5 @@
+import requests
+
 from kis_ai_scalper.broker.kis_endpoints import KisEnvironment
 from kis_ai_scalper.broker.kis_rate_limit import (
     KisRateLimitedSession,
@@ -28,8 +30,9 @@ class FakeSession:
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def json(self):
         return self._payload
@@ -97,6 +100,72 @@ def test_rate_limited_get_retries_after_shared_cooldown():
             return FakeResponse({"rt_cd": "0"})
 
     raw = RateLimitedSession()
+    session = KisRateLimitedSession(
+        KisEnvironment.DEMO,
+        raw,
+        limiter=KisRateLimiter(clock=clock, sleeper=sleep),
+    )
+
+    response = session.get("https://example.test/orders")
+
+    assert response.json()["rt_cd"] == "0"
+    assert raw.calls == 2
+    assert sleeps == [1.0]
+
+
+def test_transient_gateway_failure_get_is_retried():
+    clock = FakeClock()
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    class TransientSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResponse(
+                    {"rt_cd": "1", "msg_cd": "EGW00300"}, status_code=500
+                )
+            return FakeResponse({"rt_cd": "0"})
+
+    raw = TransientSession()
+    session = KisRateLimitedSession(
+        KisEnvironment.DEMO,
+        raw,
+        limiter=KisRateLimiter(clock=clock, sleeper=sleep),
+    )
+
+    response = session.get("https://example.test/orders")
+
+    assert response.json()["rt_cd"] == "0"
+    assert raw.calls == 2
+    assert sleeps == [1.0]
+
+
+def test_transient_connection_failure_get_is_retried():
+    clock = FakeClock()
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    class TransientSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.ConnectionError("connection closed")
+            return FakeResponse({"rt_cd": "0"})
+
+    raw = TransientSession()
     session = KisRateLimitedSession(
         KisEnvironment.DEMO,
         raw,

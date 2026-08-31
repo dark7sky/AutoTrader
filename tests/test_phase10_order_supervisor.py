@@ -404,6 +404,15 @@ def test_status_reasons_include_safe_reconciliation_stale_and_cancel_causes(tmp_
     assert all("005930" not in reason and "secret" not in reason for reason in payload["reasons"])
 
 
+def test_status_reason_preserves_safe_network_error_type():
+    reason = supervisor._safe_reason(
+        "order_status_unavailable:ConnectionError:account=12345678"
+    )
+
+    assert reason == "order_status_unavailable:ConnectionError"
+    assert "12345678" not in reason
+
+
 def test_environment_change_rebuilds_clients(tmp_path, monkeypatch):
     path, now = make_db(tmp_path)
     monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: noop_reconciliation())
