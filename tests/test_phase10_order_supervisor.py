@@ -197,17 +197,22 @@ def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkey
         "Reconciliation", (), {
             "operator_review": True,
             "block_new_entries": True,
-            "reasons": ("order_status_unavailable:KisHttpError:http_200:rt_cd_-1:msg_cd_EGW00123",),
+            "reasons": ("order_status_unavailable:KisHttpError:http_500:rt_cd_1:msg_cd_EGW00123",),
         },
     )())
     monkeypatch.setattr(supervisor, "manage_stale_orders", lambda *a, **k: noop_management())
     messages = []
     state = supervisor.SupervisorState()
+    refresh_requests = []
+
+    def factory(environment, refresh_token=False):
+        refresh_requests.append(refresh_token)
+        return FakeOrderClient(), FakeAccountClient()
 
     result = supervisor.one_iteration(
         "config/settings.yaml", path, notifier=messages.append, state=state,
         expected_owner_id="owner-1",
-        client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+        client_factory=factory,
         now=now,
     )
 
@@ -219,8 +224,8 @@ def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkey
     assert payload["healthy_streak"] == 0
     assert payload["next_retry_seconds"] == 5
     assert payload["safe_kis_error"] == {
-        "http_status": "200",
-        "rt_cd": "-1",
+        "http_status": "500",
+        "rt_cd": "1",
         "msg_cd": "EGW00123",
     }
     assert result.auth_refresh_requested is True
@@ -232,7 +237,7 @@ def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkey
         supervisor.one_iteration(
             "config/settings.yaml", path, notifier=messages.append, state=state,
             expected_owner_id="owner-1",
-            client_factory=lambda environment, refresh_token=False: (FakeOrderClient(), FakeAccountClient()),
+            client_factory=factory,
             now=now + timedelta(seconds=offset),
         )
 
@@ -242,6 +247,7 @@ def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkey
         recovered = json.loads(database.get_runtime_metadata(supervisor.STATUS_KEY))
     assert recovered["status"] == "reconciled"
     assert recovered["healthy_streak"] == 3
+    assert refresh_requests == [False, True]
     assert any("recovered" in message for message in messages)
 
 
