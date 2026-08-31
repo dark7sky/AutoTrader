@@ -17,6 +17,7 @@ KIS_REST_INTERVAL_SECONDS = {
     KisEnvironment.REAL: 0.05,
 }
 KIS_RATE_LIMIT_CODE = "EGW00201"
+KIS_TRANSIENT_READ_CODES = frozenset({KIS_RATE_LIMIT_CODE, "EGW00300"})
 KIS_RATE_LIMIT_COOLDOWN_SECONDS = 1.0
 KIS_READ_MAX_RETRIES = 2
 
@@ -84,6 +85,19 @@ def _is_rate_limited(response: Any) -> bool:
     )
 
 
+def _is_transient_read_response(response: Any) -> bool:
+    try:
+        status_code = int(getattr(response, "status_code", 200))
+    except (TypeError, ValueError):
+        status_code = 200
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        payload = {}
+    msg_cd = str(payload.get("msg_cd", "")) if isinstance(payload, Mapping) else ""
+    return status_code >= 500 or msg_cd in KIS_TRANSIENT_READ_CODES
+
+
 class KisRateLimitedSession:
     """requests-compatible session that shares one process-wide limiter."""
 
@@ -105,8 +119,17 @@ class KisRateLimitedSession:
     def get(self, url: str, **kwargs: Any) -> Any:
         for attempt in range(KIS_READ_MAX_RETRIES + 1):
             self._limiter.wait(self.environment)
-            response = self._session.get(url, **kwargs)
-            if not _is_rate_limited(response) or attempt >= KIS_READ_MAX_RETRIES:
+            try:
+                response = self._session.get(url, **kwargs)
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt >= KIS_READ_MAX_RETRIES:
+                    raise
+                self._limiter.penalize(self.environment)
+                continue
+            if (
+                not _is_transient_read_response(response)
+                or attempt >= KIS_READ_MAX_RETRIES
+            ):
                 return response
             self._limiter.penalize(self.environment)
         raise AssertionError("unreachable")
@@ -138,6 +161,7 @@ __all__ = [
     "KIS_RATE_LIMIT_COOLDOWN_SECONDS",
     "KIS_READ_MAX_RETRIES",
     "KIS_REST_INTERVAL_SECONDS",
+    "KIS_TRANSIENT_READ_CODES",
     "KisRateLimitedSession",
     "KisRateLimiter",
     "new_rate_limited_session",

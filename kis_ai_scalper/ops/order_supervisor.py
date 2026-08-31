@@ -46,6 +46,18 @@ DEFAULT_BROKER_READ_THROTTLE_SECONDS = 0.25
 RECOVERY_HEALTHY_ITERATIONS = 3
 KIS_AUTH_ERROR_MSG_CODES = frozenset({"EGW00123"})
 KIS_RATE_LIMIT_MSG_CODES = frozenset({"EGW00201"})
+SAFE_DEPENDENCY_ERROR_TYPES = frozenset({
+    "ChunkedEncodingError",
+    "ConnectionError",
+    "ConnectTimeout",
+    "KisHttpError",
+    "ReadTimeout",
+    "SSLError",
+    "Timeout",
+    "TimeoutError",
+    "TypeError",
+    "ValueError",
+})
 
 
 ClientFactory = Callable[..., Any]
@@ -97,7 +109,7 @@ def _safe_reason(value: Any) -> str:
     if not text:
         return "unknown"
     parts = text.split(":")
-    if text in {"TimeoutError", "KisHttpError", "ValueError", "TypeError"}:
+    if text in SAFE_DEPENDENCY_ERROR_TYPES:
         return text
     code = parts[0].strip().lower() or "unknown"
     safe_details = [
@@ -114,8 +126,9 @@ def _safe_reason(value: Any) -> str:
     if safe_details:
         return ":".join([code, *safe_details])
     if len(parts) > 1:
-        detail = parts[-1].strip()
-        if detail in {"TimeoutError", "KisHttpError", "ValueError", "TypeError"}:
+        for detail in (part.strip() for part in parts[1:]):
+            if detail not in SAFE_DEPENDENCY_ERROR_TYPES:
+                continue
             return f"{code}:{detail}"
     return code
 
