@@ -44,6 +44,7 @@ CANCEL_STATUS_KEY = "operator.cancel_open_buys_status"
 DEFAULT_NOTIFY_THROTTLE_SECONDS = 300.0
 DEFAULT_BROKER_READ_THROTTLE_SECONDS = 0.25
 RECOVERY_HEALTHY_ITERATIONS = 3
+KIS_AUTH_ERROR_MSG_CODES = frozenset({"EGW00123"})
 KIS_RATE_LIMIT_MSG_CODES = frozenset({"EGW00201"})
 
 
@@ -300,13 +301,19 @@ def _sanitized_error(exc: BaseException) -> str:
 
 def _looks_like_auth_error(value: Any) -> bool:
     if isinstance(value, KisHttpError):
+        msg_cd = str(value.details.get("msg_cd") or "").upper()
         details = " ".join(str(item) for item in value.details.values()).lower()
-        return value.status_code == 401 or any(
+        return value.status_code == 401 or msg_cd in KIS_AUTH_ERROR_MSG_CODES or any(
             marker in details
             for marker in ("token expired", "expired token", "만료")
         )
     text = str(value).lower()
-    return any(
+    code_markers = tuple(
+        marker
+        for code in KIS_AUTH_ERROR_MSG_CODES
+        for marker in (f"msg_cd={code.lower()}", f"msg_cd_{code.lower()}")
+    )
+    return any(marker in text for marker in code_markers) or any(
         token in text
         for token in (
             "401",
