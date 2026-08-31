@@ -129,6 +129,9 @@ def test_service_reserves_single_websocket_for_market_stream(tmp_path, monkeypat
     assert len(worker_calls["order"]) == 1
     with connect_database(str(db_path)) as database:
         assert database.get_runtime_metadata("fill-notice:status") == "rest_reconciliation"
+        heartbeat = datetime.fromisoformat(database.get_heartbeat("fill-notice"))
+    assert heartbeat.tzinfo is not None
+    assert abs((datetime.now(timezone.utc) - heartbeat).total_seconds()) < 5
 
 
 def test_emergency_stop_pauses_and_requests_cancel_for_known_buy(tmp_path):

@@ -104,3 +104,15 @@ def test_no_signal_case():
     snapshot = build_feature_snapshot(make_bars([100] * 25, [100] * 25))
     assert snapshot is not None
     assert scan_candidates(snapshot) == []
+
+
+def test_aggressive_profile_accepts_lower_volume_near_breakout():
+    closes = [100 + index for index in range(20)] + [119.8]
+    snapshot = build_feature_snapshot(make_bars(closes, [100] * 20 + [50]))
+    assert snapshot is not None
+
+    assert scan_candidates(snapshot, profile="normal") == []
+    assert any(
+        candidate.strategy == "MOMENTUM_CONTINUATION"
+        for candidate in scan_candidates(snapshot, profile="aggressive")
+    )
