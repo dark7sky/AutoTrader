@@ -223,6 +223,8 @@ def test_dependency_review_backoff_and_three_healthy_iterations(tmp_path, monkey
         "rt_cd": "-1",
         "msg_cd": "EGW00123",
     }
+    assert result.auth_refresh_requested is True
+    assert state.force_refresh is True
 
     reports = iter([noop_reconciliation(), noop_reconciliation(), noop_reconciliation()])
     monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: next(reports))
@@ -460,14 +462,16 @@ def test_exception_blocks_entries_and_records_sanitized_error(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize(
-    ("status_code", "refresh_expected"),
-    [(403, False), (401, True)],
+    ("status_code", "msg_cd", "refresh_expected"),
+    [(500, "EGW00123", True), (401, "UNKNOWN", True), (403, "UNKNOWN", False)],
 )
-def test_auth_refresh_only_requested_for_401(tmp_path, monkeypatch, status_code, refresh_expected):
+def test_auth_refresh_requested_for_expired_token_code_or_401(
+    tmp_path, monkeypatch, status_code, msg_cd, refresh_expected
+):
     path, _ = make_db(tmp_path)
     error = KisHttpError(
         status_code,
-        {"rt_cd": "-1", "msg_cd": "EGW00123", "msg1": "auth failure"},
+        {"rt_cd": "1", "msg_cd": msg_cd, "msg1": "auth failure"},
     )
     monkeypatch.setattr(supervisor, "reconcile_broker_state", lambda *a, **k: (_ for _ in ()).throw(error))
 
