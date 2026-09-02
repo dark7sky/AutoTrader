@@ -116,7 +116,7 @@ def test_commands_send_status_and_report(tmp_path, monkeypatch):
     assert "paper report" in fake.sent[-1][1]
 
 
-def test_callback_is_acknowledged_and_controls_pause(tmp_path):
+def test_legacy_pause_callback_activates_emergency_stop(tmp_path):
     path = tmp_path / "control.sqlite3"
     fake = FakeTelegram()
     update = {"callback_query": {
@@ -129,6 +129,20 @@ def test_callback_is_acknowledged_and_controls_pause(tmp_path):
     with connect_database(path) as database:
         database.init_schema()
         assert database.get_runtime_control().paused is True
+        assert database.get_runtime_metadata(telegram_module.EMERGENCY_STOP_KEY) == "true"
+
+
+def test_control_menu_only_exposes_emergency_pause_controls():
+    callbacks = {
+        button["callback_data"]
+        for row in telegram_module.CONTROL_MENU_KEYBOARD["inline_keyboard"]
+        for button in row
+    }
+
+    assert "control:pause" not in callbacks
+    assert "control:resume" not in callbacks
+    assert "control:emergency-stop" in callbacks
+    assert "control:clear-emergency" in callbacks
 
 
 def test_start_and_menu_send_main_menu_keyboard(tmp_path):

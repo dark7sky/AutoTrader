@@ -26,7 +26,7 @@ def test_service_parser_removes_pause_bypass_and_defaults_collection_to_10(monke
         cli.build_parser().parse_args(["service-loop", "--no-pause-on-start"])
 
 
-def test_service_loop_pauses_even_when_legacy_argument_is_false(tmp_path, monkeypatch):
+def test_service_loop_auto_resumes_on_restart_without_emergency_stop(tmp_path, monkeypatch):
     db_path = tmp_path / "service.sqlite3"
     with connect_database(db_path) as database:
         database.init_schema()
@@ -46,8 +46,33 @@ def test_service_loop_pauses_even_when_legacy_argument_is_false(tmp_path, monkey
 
     with connect_database(db_path) as database:
         control = database.get_runtime_control()
+        assert control.paused is False
+        assert control.reason == "service_start_auto_resume"
+
+
+def test_service_loop_preserves_emergency_stop_across_restart(tmp_path, monkeypatch):
+    db_path = tmp_path / "service.sqlite3"
+    with connect_database(db_path) as database:
+        database.init_schema()
+        database.set_runtime_paused(True, "telegram_emergency_stop", "telegram")
+        database.set_runtime_metadata("telegram.emergency_stop", "true")
+
+    def stop_preflight(*_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_telegram_notifier_from_env", lambda *_args: None)
+    monkeypatch.setattr(cli, "_runtime_preflight", stop_preflight)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.service_loop(
+            "config/settings.yaml", "005930", str(db_path), "rule", 1, 0,
+            1, 0, 0, False,
+        )
+
+    with connect_database(db_path) as database:
+        control = database.get_runtime_control()
         assert control.paused is True
-        assert control.reason == "service_start_default_pause"
+        assert control.reason == "telegram_emergency_stop"
 
 
 def test_preflight_alert_throttle_persists_across_restart_and_changes_alert_immediately(

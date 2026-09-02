@@ -417,9 +417,8 @@ def test_emergency_stop_blocks_resume_until_cleared_while_paused(tmp_path, monke
     assert handle_update(private("/clear-emergency"), path, fake, "42") is True
     with connect_database(path) as database:
         assert database.get_runtime_metadata(EMERGENCY_STOP_KEY) == "false"
-        assert database.get_runtime_control().paused is True
-    assert handle_update(private("/resume"), path, fake, "42") is True
-    assert "runtime resumed" in fake.sent[-1][1]
+        assert database.get_runtime_control().paused is False
+    assert "automatic runtime control restored" in fake.sent[-1][1]
 
 
 def test_poll_uses_env_allowed_user_id_when_argument_is_omitted(tmp_path, monkeypatch):
