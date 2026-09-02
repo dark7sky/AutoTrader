@@ -69,7 +69,16 @@ from kis_ai_scalper.paper import PaperFill, PaperLedger, PaperOrderIntent, Paper
 from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.ops.control import control_status, set_paused
 from kis_ai_scalper.ops.openai_usage import openai_cost_summary_from_env
-from kis_ai_scalper.ops.telegram import TelegramClient, env_value, optional_env_value, poll_telegram
+from kis_ai_scalper.ops.telegram import (
+    AUTO_PAUSE_KEY,
+    AUTO_PAUSE_REASON_KEY,
+    CANCEL_OPEN_BUYS_KEY,
+    EMERGENCY_STOP_KEY,
+    TelegramClient,
+    env_value,
+    optional_env_value,
+    poll_telegram,
+)
 from kis_ai_scalper.ops.trading_frequency import read_trade_frequency
 from kis_ai_scalper.ops.fill_notice_worker import run_fill_notice_worker
 from kis_ai_scalper.ops.order_supervisor import run_order_supervisor
@@ -430,6 +439,36 @@ ORDER_MANAGEMENT_ALERT_FINGERPRINT_KEY = "service:order_management_alert:fingerp
 ORDER_MANAGEMENT_ALERT_AT_KEY = "service:order_management_alert:at"
 
 
+def _metadata_flag(database: Any, *keys: str) -> bool:
+    return any(
+        (database.get_runtime_metadata(key) or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+        for key in keys
+    )
+
+
+def _sync_service_runtime(database: Any, *, startup: bool = False) -> Any:
+    """Persist only the operator emergency stop across service lifecycles."""
+    control = database.get_runtime_control()
+    emergency = _metadata_flag(database, EMERGENCY_STOP_KEY, "emergency_stop")
+    if emergency:
+        if not control.paused:
+            return database.set_runtime_paused(
+                True, "emergency_stop_restored", "service"
+            )
+        return control
+    if startup or control.paused:
+        return database.set_runtime_paused(
+            False, "service_start_auto_resume" if startup else "automatic_recovery", "service"
+        )
+    return control
+
+
+def _set_automatic_pause(database: Any, active: bool, reason: str = "") -> None:
+    database.set_runtime_metadata(AUTO_PAUSE_KEY, "true" if active else "false")
+    database.set_runtime_metadata(AUTO_PAUSE_REASON_KEY, reason if active else "")
+
+
 def _env_number(name: str, default: float, *, integer: bool = False,
                 minimum: float | None = None, maximum: float | None = None) -> float | int:
     raw = optional_env_value(name)
@@ -682,8 +721,7 @@ def service_loop(
             SERVICE_LEASE_NAME, owner_id, SERVICE_LEASE_TTL_SECONDS,
         ):
             raise RuntimeError("another trading-service instance already holds the service lease")
-        # A service restart always requires an explicit operator resume.
-        lease_database.set_runtime_paused(True, "service_start_default_pause", "service")
+        control = _sync_service_runtime(lease_database, startup=True)
         try:
             if notifier is not None:
                 install_menu = getattr(notifier, "install_menu", None)
@@ -698,8 +736,8 @@ def service_loop(
                 try:
                     startup_text = (
                         "auto-trade service started\n"
-                        "runtime: paused\n"
-                        "Use the menu after env/positions are checked."
+                        f"runtime: {'paused (emergency stop)' if control.paused else 'running'}\n"
+                        "Automatic dependency recovery is enabled."
                     )
                     send_menu = getattr(notifier, "send_menu", None)
                     if callable(send_menu):
@@ -753,6 +791,7 @@ def service_loop(
                 try:
                     now = kst_now()
                     lease_database.record_heartbeat("trading-service", heartbeat_at=datetime.now().astimezone())
+                    control = _sync_service_runtime(lease_database)
                     if not lease_database.renew_service_lease(
                         SERVICE_LEASE_NAME, owner_id, SERVICE_LEASE_TTL_SECONDS,
                     ):
@@ -770,8 +809,8 @@ def service_loop(
                     env = KisEnvironment.parse(control.environment)
                     errors = _runtime_preflight(config_path, env, ai)
                     if errors:
-                        set_paused(db_path, True, "preflight_failed", "service")
-                        message = "auto-trade paused: setup issue\n" + "\n".join(f"- {item}" for item in errors)
+                        _set_automatic_pause(lease_database, True, "preflight_failed")
+                        message = "auto-trade auto-paused: setup issue\n" + "\n".join(f"- {item}" for item in errors)
                         print(message)
                         _send_throttled_service_alert(
                             lease_database,
@@ -783,6 +822,7 @@ def service_loop(
                         )
                         _sleep_remaining(started, cycle_interval_seconds)
                         continue
+                    _set_automatic_pause(lease_database, False)
                     if collect_seconds > 0:
                         fill_heartbeat_at = datetime.now(timezone.utc)
                         lease_database.record_heartbeat(
@@ -891,11 +931,21 @@ def service_loop(
                         if message != last_alert or time.monotonic() - last_alert_at > 300:
                             last_alert, last_alert_at = message, time.monotonic()
                             _notify_operator_if_possible(
-                                message + "\nNew entries are blocked; runtime is not auto-paused.",
+                                message + "\nNew entries are auto-paused until recovery.",
                                 notifier=notifier,
                             )
                     cycle_control = control
-                    if telegram_poll_failed.is_set() or state.portfolio.fail_closed:
+                    automatic_gate_reasons = []
+                    if telegram_poll_failed.is_set():
+                        automatic_gate_reasons.append("telegram_poll_unavailable")
+                    if state.portfolio.fail_closed:
+                        automatic_gate_reasons.append("portfolio_unavailable")
+                    _set_automatic_pause(
+                        lease_database,
+                        bool(automatic_gate_reasons),
+                        ",".join(automatic_gate_reasons),
+                    )
+                    if automatic_gate_reasons:
                         cycle_control = replace(control, paused=True, reason="entry_gate_blocked")
                     auto_trade_cycle(
                         config_path, env.value, symbols_text, db_path, ai,
@@ -913,6 +963,11 @@ def service_loop(
                 except Exception as exc:
                     message = f"service cycle warning: {type(exc).__name__}"
                     print(message, file=sys.stderr)
+                    _set_automatic_pause(
+                        lease_database,
+                        True,
+                        f"service_cycle_error:{type(exc).__name__}",
+                    )
                     lease_database.set_runtime_metadata("service:last_error", message, updated_at=kst_now())
                     _notify_operator_if_possible(message, notifier=notifier)
                 _sleep_remaining(started, cycle_interval_seconds)
@@ -1713,6 +1768,7 @@ def auto_trade_cycle(
             or database.get_runtime_metadata("telegram.emergency_stop")
             or ""
         )
+        cancel_open_buys = database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY) or ""
     emergency_active = emergency_value.strip().lower() in {"1", "true", "yes", "on"}
     gate_reasons = []
     if latest_control.paused:
@@ -1721,6 +1777,8 @@ def auto_trade_cycle(
         gate_reasons.append("runtime_environment_mismatch")
     if emergency_active:
         gate_reasons.append("emergency_stop")
+    if cancel_open_buys.strip().lower() in {"1", "true", "yes", "on"}:
+        gate_reasons.append("open_buy_cancellation_pending")
     if gate_reasons:
         print("auto-trade-cycle: BLOCKED")
         print(

@@ -53,6 +53,7 @@ def _patch_service_dependencies(monkeypatch, *, preflight_errors, worker_calls):
     monkeypatch.setattr(cli, "_runtime_preflight", lambda *args: list(preflight_errors))
     monkeypatch.setattr(cli, "_sleep_remaining", lambda *args: (_ for _ in ()).throw(KeyboardInterrupt))
     monkeypatch.setattr(cli, "_notify_operator_if_possible", lambda *args: False)
+    monkeypatch.setattr(cli, "is_regular_market_open", lambda *_args: False)
 
     def fake_fill_notice_worker(**kwargs):
         worker_calls["fill"].append(kwargs)

@@ -364,10 +364,10 @@ def test_real_environment_requires_challenge_confirmation_and_one_time_arm(tmp_p
         assert database.get_runtime_control().environment == "real"
         assert database.get_runtime_metadata(REAL_RESUME_ARM_EXPIRES_KEY)
 
-    assert handle_update(private("/resume"), path, fake, "42") is True
-    assert "runtime resumed" in fake.sent[-1][1]
+    assert handle_update(private("/clear-emergency"), path, fake, "42") is True
+    assert "automatic runtime control restored" in fake.sent[-1][1]
     assert handle_update(private("/pause"), path, fake, "42") is True
-    assert handle_update(private("/resume"), path, fake, "42") is True
+    assert handle_update(private("/clear-emergency"), path, fake, "42") is True
     assert "rejected" in fake.sent[-1][1]
 
 

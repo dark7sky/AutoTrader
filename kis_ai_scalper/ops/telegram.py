@@ -30,6 +30,8 @@ REAL_RESUME_ARM_EXPIRES_KEY = "telegram.real_resume_arm_expires"
 REAL_RESUME_ARM_USES_KEY = "telegram.real_resume_arm_uses"
 EMERGENCY_STOP_KEY = "telegram.emergency_stop"
 CANCEL_OPEN_BUYS_KEY = "operator.cancel_open_buys_requested"
+AUTO_PAUSE_KEY = "runtime.auto_paused"
+AUTO_PAUSE_REASON_KEY = "runtime.auto_pause_reason"
 LIVE_REPORT_SNAPSHOT_KEY = "live_report_snapshot"
 HEARTBEAT_MAX_AGE_SECONDS = 180.0
 
@@ -169,10 +171,6 @@ TRADING_MENU_KEYBOARD = {
 
 CONTROL_MENU_KEYBOARD = {
     "inline_keyboard": [
-        [
-            {"text": "일시정지", "callback_data": "control:pause"},
-            {"text": "거래 재개", "callback_data": "control:resume"},
-        ],
         [{"text": "미체결 매수 취소", "callback_data": "control:cancel-open-buys"}],
         [
             {"text": "긴급 정지", "callback_data": "control:emergency-stop"},
@@ -384,9 +382,16 @@ def _status_text(db_path: str) -> str:
         operator_review = database.get_runtime_metadata("operator_review")
         block_entries = database.get_runtime_metadata("block_new_entries")
         emergency = database.get_runtime_metadata(EMERGENCY_STOP_KEY) or database.get_runtime_metadata("emergency_stop")
+        auto_paused = database.get_runtime_metadata(AUTO_PAUSE_KEY)
+        auto_pause_reason = database.get_runtime_metadata(AUTO_PAUSE_REASON_KEY)
         cancel_open_buys = database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY)
     frequency = _frequency_settings(db_path)
-    state = "paused" if control.paused else "running"
+    automatically_blocked = (
+        _safe_flag(auto_paused) == "true"
+        or _safe_flag(operator_review) == "true"
+        or _safe_flag(block_entries) == "true"
+    )
+    state = "paused" if control.paused else "auto_paused" if automatically_blocked else "running"
     heartbeat_text, heartbeat_healthy = _heartbeat_status(heartbeat)
     fill_heartbeat_text, fill_healthy = _heartbeat_status(fill_heartbeat)
     supervisor_heartbeat_text, supervisor_healthy = _heartbeat_status(supervisor_heartbeat)
@@ -404,6 +409,7 @@ def _status_text(db_path: str) -> str:
         f"operator_review: {_safe_flag(operator_review)}\n"
         f"block_new_entries: {_safe_flag(block_entries)}\n"
         f"emergency_stop: {_safe_flag(emergency)}\n"
+        f"automatic_pause: {_safe_flag(auto_paused)} reason={auto_pause_reason or 'none'}\n"
         f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}\n"
         f"trade_frequency: profile={frequency.profile} "
         f"ai_min_confidence={frequency.ai_min_confidence:.2f} "
@@ -1060,11 +1066,14 @@ def handle_update(
     elif command_name in {"/approvals", "approvals"}:
         text, reply_markup = _approvals_text(db_path)
     elif command_name in {"/pause", "pause"}:
-        reason = "telegram_operator"
-        if command and " " in command[0]:
-            reason = command[0].split(" ", 1)[1]
-        set_paused(db_path, True, reason, "telegram")
-        text = "runtime paused"
+        _set_metadata(db_path, EMERGENCY_STOP_KEY, "true")
+        set_paused(db_path, True, "telegram_emergency_stop", "telegram")
+        cancellation_requested = _request_open_buy_cancellation(db_path)
+        text = (
+            "emergency stop active; runtime paused; open BUY cancellation requested"
+            if cancellation_requested
+            else "emergency stop active; runtime paused; no open BUY orders"
+        )
     elif command_name in {"/resume", "resume"}:
         reason = "telegram_operator"
         if command and " " in command[0]:
@@ -1113,8 +1122,8 @@ def handle_update(
     elif command_name in {"/fills", "fills"}:
         text = _fills_text(db_path)
     elif command_name in {"/emergency-stop", "emergency-stop"}:
-        set_paused(db_path, True, "telegram_emergency_stop", "telegram")
         _set_metadata(db_path, EMERGENCY_STOP_KEY, "true")
+        set_paused(db_path, True, "telegram_emergency_stop", "telegram")
         cancellation_requested = _request_open_buy_cancellation(db_path)
         _set_metadata(db_path, REAL_RESUME_ARM_EXPIRES_KEY, "")
         _set_metadata(db_path, REAL_RESUME_ARM_USES_KEY, "0")
@@ -1124,11 +1133,10 @@ def handle_update(
             else "emergency stop active; runtime paused; no open BUY orders"
         )
     elif command_name in {"/cancel-open-buys", "cancel-open-buys"}:
-        set_paused(db_path, True, "telegram_cancel_open_buys", "telegram")
         text = (
-            "runtime paused; open BUY cancellation requested"
+            "open BUY cancellation requested; new entries temporarily blocked"
             if _request_open_buy_cancellation(db_path)
-            else "runtime paused; no open BUY orders"
+            else "no open BUY orders"
         )
     elif command_name in {"/environment:demo", "/environment:real"}:
         value = command_name.split(":", 1)[1]
@@ -1143,14 +1151,17 @@ def handle_update(
             else:
                 text = f"runtime environment: {selected.environment}"
     elif command_name in {"/clear-emergency", "clear-emergency"}:
-        with connect_database(db_path) as database:
-            database.init_schema()
-            control = database.get_runtime_control()
-            if not control.paused:
-                text = "clear emergency rejected: runtime must be paused"
-            else:
+        if not _real_resume_allowed(db_path):
+            text = "clear emergency rejected: real environment requires a fresh challenge confirmation"
+        else:
+            with connect_database(db_path) as database:
+                database.init_schema()
                 database.set_runtime_metadata(EMERGENCY_STOP_KEY, "false")
-                text = "emergency stop cleared; runtime remains paused"
+                database.set_runtime_metadata("emergency_stop", "false")
+                database.set_runtime_paused(
+                    False, "emergency_stop_cleared", "telegram"
+                )
+            text = "emergency stop cleared; automatic runtime control restored"
     elif command_name in {"/report", "report"}:
         text = _report_text(db_path)
     elif command_name in {"/live-report", "live-report"}:
