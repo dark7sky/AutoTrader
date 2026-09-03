@@ -30,6 +30,7 @@ from kis_ai_scalper.broker.kis_realized_pnl import (
     KisRealizedPnlUnsupportedError,
 )
 from kis_ai_scalper.broker.kis_rest import KisRestClient
+from kis_ai_scalper.broker.kis_rankings import KisVolumeRankingClient
 from kis_ai_scalper.broker.kis_endpoints import websocket_url
 from kis_ai_scalper.broker.kis_ws import smoke_realtime_price
 from kis_ai_scalper.broker.kis_fill_notice import smoke_fill_notice as smoke_kis_fill_notice
@@ -80,6 +81,10 @@ from kis_ai_scalper.ops.telegram import (
     poll_telegram,
 )
 from kis_ai_scalper.ops.trading_frequency import read_trade_frequency
+from kis_ai_scalper.ops.auto_universe import (
+    AutoUniverseSettings,
+    resolve_service_symbols,
+)
 from kis_ai_scalper.ops.fill_notice_worker import run_fill_notice_worker
 from kis_ai_scalper.ops.order_supervisor import run_order_supervisor
 from kis_ai_scalper.ai.reliable import UsageBudget
@@ -487,6 +492,103 @@ def _env_number(name: str, default: float, *, integer: bool = False,
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = optional_env_value(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _auto_universe_settings_from_env() -> AutoUniverseSettings:
+    return AutoUniverseSettings(
+        enabled=_env_bool("AUTO_UNIVERSE_ENABLED", True),
+        size=int(_env_number("AUTO_UNIVERSE_SIZE", 5, integer=True, minimum=1, maximum=20)),
+        refresh_seconds=int(_env_number(
+            "AUTO_UNIVERSE_REFRESH_SECONDS", 1800, integer=True, minimum=60,
+        )),
+        failure_retry_seconds=int(_env_number(
+            "AUTO_UNIVERSE_FAILURE_RETRY_SECONDS", 60, integer=True, minimum=5,
+        )),
+        min_price=float(_env_number("AUTO_UNIVERSE_MIN_PRICE", 2_000, minimum=0)),
+        max_price=float(_env_number("AUTO_UNIVERSE_MAX_PRICE", 200_000, minimum=1)),
+        min_volume=int(_env_number(
+            "AUTO_UNIVERSE_MIN_VOLUME", 100_000, integer=True, minimum=0,
+        )),
+        min_change_pct=float(_env_number(
+            "AUTO_UNIVERSE_MIN_CHANGE_PCT", 0.5, minimum=0, maximum=29,
+        )),
+        max_change_pct=float(_env_number(
+            "AUTO_UNIVERSE_MAX_CHANGE_PCT", 20.0, minimum=0.1, maximum=30,
+        )),
+    )
+
+
+def _discover_auto_universe(
+    config_path: str,
+    environment: KisEnvironment | str,
+    settings: AutoUniverseSettings,
+    refresh_token: bool,
+) -> list[str]:
+    env = KisEnvironment.parse(environment) if isinstance(environment, str) else environment
+    config = load_config(Path(config_path))
+    kis_api = _kis_api_for(config, env)
+    project_root = Path(config_path).resolve().parent.parent
+    cache_path = project_root / "data" / "auth" / f"kis_token_{env.value}.json"
+    auth_result = KisAuthClient(
+        env, kis_api.app_key, kis_api.app_secret,
+    ).authenticate_read_only(cache_path=cache_path, refresh_token=refresh_token)
+    ranked = KisVolumeRankingClient(
+        env,
+        kis_api.app_key,
+        kis_api.app_secret,
+        auth_result.access_token,
+    ).get_active_stocks(
+        limit=settings.size,
+        min_price=settings.min_price,
+        max_price=settings.max_price,
+        min_volume=settings.min_volume,
+        min_change_pct=settings.min_change_pct,
+        max_change_pct=settings.max_change_pct,
+    )
+    return [stock.symbol for stock in ranked]
+
+
+def _resolve_service_symbols_for_cycle(
+    config_path: str,
+    environment: KisEnvironment | str,
+    db_path: str,
+    symbols_text: str | None,
+    refresh_token: bool,
+    now: datetime,
+) -> list[str]:
+    settings = _auto_universe_settings_from_env()
+    with connect_database(db_path) as database:
+        database.init_schema()
+        base_symbols = (
+            _parse_symbols(symbols_text)
+            if symbols_text
+            else database.list_watchlist_symbols()
+        )
+        open_symbols = [
+            str(row["symbol"]) for row in database.list_open_live_positions()
+        ]
+        return resolve_service_symbols(
+            database,
+            base_symbols=base_symbols,
+            open_position_symbols=open_symbols,
+            discover=lambda selected: _discover_auto_universe(
+                config_path, environment, selected, refresh_token,
+            ),
+            settings=settings,
+            now=now,
+        )
+
+
 def _risk_config_from_env(db_path: str | None = None):
     defaults = RiskConfig()
     config = RiskConfig(
@@ -890,17 +992,9 @@ def service_loop(
                         _sleep_remaining(started, cycle_interval_seconds)
                         continue
 
-                    symbols = _parse_symbols(symbols_text) if symbols_text else []
-                    if not symbols:
-                        with connect_database(db_path) as database:
-                            database.init_schema()
-                            symbols = database.list_watchlist_symbols()
-                    with connect_database(db_path) as database:
-                        database.init_schema()
-                        symbols = list(dict.fromkeys([
-                            *symbols,
-                            *(str(row["symbol"]) for row in database.list_open_live_positions()),
-                        ]))
+                    symbols = _resolve_service_symbols_for_cycle(
+                        config_path, env, db_path, symbols_text, refresh_token, now,
+                    )
                     _collect_service_market_window(
                         config_path,
                         env,
@@ -948,7 +1042,7 @@ def service_loop(
                     if automatic_gate_reasons:
                         cycle_control = replace(control, paused=True, reason="entry_gate_blocked")
                     auto_trade_cycle(
-                        config_path, env.value, symbols_text, db_path, ai,
+                        config_path, env.value, ",".join(symbols), db_path, ai,
                         max_quantity, 0, "AUTO_TRADE",
                         notify_telegram=notifier is not None,
                         refresh_token=refresh_token,

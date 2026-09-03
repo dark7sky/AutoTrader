@@ -27,7 +27,7 @@ class TradeFrequencySettings:
 FREQUENCY_PRESETS: dict[str, TradeFrequencySettings] = {
     "conservative": TradeFrequencySettings("conservative", 0.82),
     "normal": TradeFrequencySettings("normal", 0.75),
-    "aggressive": TradeFrequencySettings("aggressive", 0.70),
+    "aggressive": TradeFrequencySettings("aggressive", 0.65),
 }
 
 

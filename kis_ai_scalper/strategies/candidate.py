@@ -29,7 +29,7 @@ class CandidateThresholds:
 CANDIDATE_PROFILES = {
     "conservative": CandidateThresholds(-1.0, -0.4, 1.3, -0.2, 0.9, 1.5),
     "normal": CandidateThresholds(-1.5, -0.3, 1.0, -0.3, 0.6, 1.2),
-    "aggressive": CandidateThresholds(-2.0, -0.15, 0.7, -0.5, 0.5, 0.9),
+    "aggressive": CandidateThresholds(-3.0, -0.1, 0.5, -0.9, 0.35, 0.7),
 }
 
 
