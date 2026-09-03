@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from kis_ai_scalper import cli
 from kis_ai_scalper.broker.kis_auth import KisHttpError
 from kis_ai_scalper.broker.kis_rankings import (
     VOLUME_RANK_PATH,
@@ -161,3 +162,32 @@ def test_disabled_auto_universe_never_calls_discovery(tmp_path):
             now=datetime(2026, 9, 3, tzinfo=timezone.utc),
         )
     assert symbols == ["000660", "035420"]
+
+
+def test_cli_resolves_watchlist_dynamic_and_open_positions_for_same_cycle(tmp_path, monkeypatch):
+    path = tmp_path / "service-symbols.sqlite3"
+    now = datetime(2026, 9, 3, 1, 0, tzinfo=timezone.utc)
+    with connect_database(path) as database:
+        database.init_schema()
+        database.add_watchlist_symbol("000660")
+        database.connection.execute(
+            """INSERT INTO live_positions
+               (position_id,signal_id,symbol,quantity,entry_price,stop_loss_price,
+                take_profit_price,opened_at,status)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            ("p1", "s1", "035420", 1, 100, 99, 102, now.isoformat(), "OPEN"),
+        )
+        database.connection.commit()
+
+    monkeypatch.setattr(cli, "_discover_auto_universe", lambda *_args, **_kwargs: ["005930"])
+    monkeypatch.setattr(
+        cli,
+        "_auto_universe_settings_from_env",
+        lambda: AutoUniverseSettings(enabled=True, size=2, refresh_seconds=1800),
+    )
+
+    symbols = cli._resolve_service_symbols_for_cycle(
+        "config/settings.yaml", "demo", str(path), None, False, now,
+    )
+
+    assert symbols == ["000660", "005930", "035420"]

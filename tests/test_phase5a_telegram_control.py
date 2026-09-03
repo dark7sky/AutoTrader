@@ -351,7 +351,7 @@ def test_frequency_menu_and_callbacks_update_runtime_trade_cadence(tmp_path):
     }}
     assert handle_update(callback, path, fake, "42")
     assert "profile=aggressive" in fake.sent[-1][1]
-    assert "ai_min_confidence=0.70" in fake.sent[-1][1]
+    assert "ai_min_confidence=0.65" in fake.sent[-1][1]
     assert "max_trades_per_day" not in fake.sent[-1][1]
     with connect_database(path) as database:
         database.init_schema()
