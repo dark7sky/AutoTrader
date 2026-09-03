@@ -148,6 +148,35 @@ def test_auto_universe_is_cached_merged_and_retained_during_refresh_failure(tmp_
     assert error == "RuntimeError"
 
 
+def test_auto_universe_cache_accepts_service_naive_kst_clock(tmp_path):
+    path = tmp_path / "naive-kst.sqlite3"
+    now = datetime(2026, 9, 3, 10, 0)
+    settings = AutoUniverseSettings(enabled=True, refresh_seconds=1800)
+    calls = []
+
+    with connect_database(path) as database:
+        database.init_schema()
+        first = resolve_service_symbols(
+            database,
+            base_symbols=[],
+            open_position_symbols=[],
+            discover=lambda _settings: calls.append("called") or ["005930"],
+            settings=settings,
+            now=now,
+        )
+        second = resolve_service_symbols(
+            database,
+            base_symbols=[],
+            open_position_symbols=[],
+            discover=lambda _settings: (_ for _ in ()).throw(AssertionError("cache missed")),
+            settings=settings,
+            now=now + timedelta(seconds=20),
+        )
+
+    assert first == second == ["005930"]
+    assert calls == ["called"]
+
+
 def test_disabled_auto_universe_never_calls_discovery(tmp_path):
     path = tmp_path / "disabled.sqlite3"
     settings = AutoUniverseSettings(enabled=False)
