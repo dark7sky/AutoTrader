@@ -444,6 +444,18 @@ ORDER_MANAGEMENT_ALERT_FINGERPRINT_KEY = "service:order_management_alert:fingerp
 ORDER_MANAGEMENT_ALERT_AT_KEY = "service:order_management_alert:at"
 
 
+def _supervisor_dependency_blocks_service(database: Any) -> bool:
+    raw = database.get_runtime_metadata("order-supervisor.status")
+    try:
+        payload = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or "").strip().lower()
+    return status in {"dependency_unavailable", "error"}
+
+
 def _metadata_flag(database: Any, *keys: str) -> bool:
     return any(
         (database.get_runtime_metadata(key) or "").strip().lower()
@@ -924,7 +936,6 @@ def service_loop(
                         )
                         _sleep_remaining(started, cycle_interval_seconds)
                         continue
-                    _set_automatic_pause(lease_database, False)
                     if collect_seconds > 0:
                         fill_heartbeat_at = datetime.now(timezone.utc)
                         lease_database.record_heartbeat(
@@ -983,6 +994,16 @@ def service_loop(
                             daemon=True,
                         )
                         order_supervisor_thread.start()
+                    if _supervisor_dependency_blocks_service(lease_database):
+                        _set_automatic_pause(
+                            lease_database, True, "supervisor_dependency_unavailable",
+                        )
+                        print(
+                            f"service-loop: dependency_wait environment={control.environment}"
+                        )
+                        _sleep_remaining(started, cycle_interval_seconds)
+                        continue
+                    _set_automatic_pause(lease_database, False)
                     if control.paused:
                         print(f"service-loop: paused environment={control.environment}")
                         _sleep_remaining(started, cycle_interval_seconds)
