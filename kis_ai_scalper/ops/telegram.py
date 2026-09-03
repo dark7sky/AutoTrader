@@ -19,6 +19,11 @@ from kis_ai_scalper.ops.trading_frequency import (
     apply_trade_frequency_preset,
     read_trade_frequency,
 )
+from kis_ai_scalper.ops.auto_universe import (
+    AUTO_UNIVERSE_ERROR_KEY,
+    AUTO_UNIVERSE_REFRESHED_AT_KEY,
+    AUTO_UNIVERSE_SYMBOLS_KEY,
+)
 from kis_ai_scalper.paper import report_from_database
 from kis_ai_scalper.storage import connect_database
 from kis_ai_scalper.market.schedule import exchange_calendar_available, is_regular_market_open
@@ -34,6 +39,19 @@ AUTO_PAUSE_KEY = "runtime.auto_paused"
 AUTO_PAUSE_REASON_KEY = "runtime.auto_pause_reason"
 LIVE_REPORT_SNAPSHOT_KEY = "live_report_snapshot"
 HEARTBEAT_MAX_AGE_SECONDS = 180.0
+
+
+def _auto_universe_symbols(raw: str | None) -> list[str]:
+    try:
+        values = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return [
+        str(value) for value in values
+        if str(value).isdigit() and len(str(value)) == 6
+    ]
 
 
 class TelegramClient:
@@ -385,6 +403,10 @@ def _status_text(db_path: str) -> str:
         auto_paused = database.get_runtime_metadata(AUTO_PAUSE_KEY)
         auto_pause_reason = database.get_runtime_metadata(AUTO_PAUSE_REASON_KEY)
         cancel_open_buys = database.get_runtime_metadata(CANCEL_OPEN_BUYS_KEY)
+        auto_universe = _auto_universe_symbols(
+            database.get_runtime_metadata(AUTO_UNIVERSE_SYMBOLS_KEY)
+        )
+        auto_universe_error = database.get_runtime_metadata(AUTO_UNIVERSE_ERROR_KEY)
     frequency = _frequency_settings(db_path)
     automatically_blocked = (
         _safe_flag(auto_paused) == "true"
@@ -411,6 +433,8 @@ def _status_text(db_path: str) -> str:
         f"emergency_stop: {_safe_flag(emergency)}\n"
         f"automatic_pause: {_safe_flag(auto_paused)} reason={auto_pause_reason or 'none'}\n"
         f"cancel_open_buys_pending: {_safe_flag(cancel_open_buys)}\n"
+        f"auto_universe: {','.join(auto_universe) or 'none'} "
+        f"error={auto_universe_error or 'none'}\n"
         f"trade_frequency: profile={frequency.profile} "
         f"ai_min_confidence={frequency.ai_min_confidence:.2f} "
         f"candidate_sensitivity={frequency.profile} "
@@ -432,6 +456,13 @@ def _readiness(db_path: str) -> tuple[str, bool]:
         control = database.get_runtime_control()
         environment = control.environment
         watchlist = database.list_watchlist_symbols()
+        auto_universe = _auto_universe_symbols(
+            database.get_runtime_metadata(AUTO_UNIVERSE_SYMBOLS_KEY)
+        )
+        auto_universe_refreshed_at = database.get_runtime_metadata(
+            AUTO_UNIVERSE_REFRESHED_AT_KEY
+        )
+        auto_universe_error = database.get_runtime_metadata(AUTO_UNIVERSE_ERROR_KEY)
         operator_review = _safe_flag(database.get_runtime_metadata("operator_review"))
         block_entries = _safe_flag(database.get_runtime_metadata("block_new_entries"))
         emergency = _safe_flag(
@@ -458,7 +489,10 @@ def _readiness(db_path: str) -> tuple[str, bool]:
     ai = (optional_env_value("AUTO_TRADE_AI") or "openai").strip().lower()
     if ai == "openai" and optional_env_value("OPENAI_API_KEY") is None:
         blockers.append("OPENAI_API_KEY 필요(AUTO_TRADE_AI=openai)")
-    if not watchlist:
+    auto_universe_enabled = (
+        optional_env_value("AUTO_UNIVERSE_ENABLED") or "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not watchlist and not auto_universe_enabled:
         blockers.append("관심종목 없음")
     if operator_review == "true":
         detail = ",".join(supervisor_reasons)
@@ -483,6 +517,12 @@ def _readiness(db_path: str) -> tuple[str, bool]:
         f"resume_ready={str(not blockers).lower()}",
         f"LIVE_TRADING_ENABLED={str(gate).lower()} KIS={str(kis_ok).lower()} AI={ai}",
         f"watchlist={','.join(watchlist) or 'none'}",
+        (
+            f"auto_universe={','.join(auto_universe) or 'none'} "
+            f"enabled={str(auto_universe_enabled).lower()} "
+            f"refreshed_at={auto_universe_refreshed_at or 'none'} "
+            f"error={auto_universe_error or 'none'}"
+        ),
         f"operator_review={operator_review} block_new_entries={block_entries} emergency={emergency} cancel_pending={str(cancel_pending == 'true' or unresolved).lower()}",
         f"worker_heartbeat=trading-service:{str(trading_heartbeat).lower()} order-supervisor:{str(supervisor_heartbeat).lower()}",
         f"order_supervisor_status={supervisor_detail['status']} order_supervisor_status_age={supervisor_detail['age']}",
@@ -506,7 +546,15 @@ def _watchlist_text(db_path: str) -> str:
     with connect_database(db_path) as database:
         database.init_schema()
         symbols = database.list_watchlist_symbols()
-    return "관심종목\n" + ("\n".join(symbols) if symbols else "none")
+        auto_universe = _auto_universe_symbols(
+            database.get_runtime_metadata(AUTO_UNIVERSE_SYMBOLS_KEY)
+        )
+    return (
+        "관심종목\n"
+        + ("\n".join(symbols) if symbols else "none")
+        + "\n\n자동선정\n"
+        + ("\n".join(auto_universe) if auto_universe else "none")
+    )
 
 
 def _watchlist_keyboard(db_path: str) -> dict[str, Any]:
