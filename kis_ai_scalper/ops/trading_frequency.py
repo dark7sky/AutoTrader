@@ -51,6 +51,10 @@ def read_trade_frequency(
         store.get_runtime_metadata(AI_MIN_CONFIDENCE_KEY),
         default_ai_min_confidence,
     )
+    # Upgrade the only previously shipped aggressive preset without requiring
+    # an operator to toggle the Telegram setting after container replacement.
+    if profile == "aggressive" and confidence == 0.70:
+        confidence = FREQUENCY_PRESETS["aggressive"].ai_min_confidence
     return TradeFrequencySettings(profile, confidence)
 
 
