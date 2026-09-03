@@ -356,7 +356,7 @@ def test_frequency_menu_and_callbacks_update_runtime_trade_cadence(tmp_path):
     with connect_database(path) as database:
         database.init_schema()
         assert database.get_runtime_metadata("trade_frequency.profile") == "aggressive"
-        assert database.get_runtime_metadata("trade_frequency.ai_min_confidence") == "0.70"
+        assert database.get_runtime_metadata("trade_frequency.ai_min_confidence") == "0.65"
 
 
 def test_watchlist_commands_validate_and_reactivate_symbols(tmp_path):

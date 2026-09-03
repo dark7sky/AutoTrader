@@ -116,3 +116,18 @@ def test_aggressive_profile_accepts_lower_volume_near_breakout():
         candidate.strategy == "MOMENTUM_CONTINUATION"
         for candidate in scan_candidates(snapshot, profile="aggressive")
     )
+
+
+def test_aggressive_profile_accepts_broader_rising_vwap_pullback():
+    closes = [100 + index for index in range(25)]
+    closes[-1] = 121.5
+    snapshot = build_feature_snapshot(make_bars(closes, [100] * 24 + [50]))
+    assert snapshot is not None
+    assert snapshot.distance_from_high_pct is not None
+    assert -3.0 <= snapshot.distance_from_high_pct < -2.0
+
+    assert scan_candidates(snapshot, profile="normal") == []
+    assert any(
+        candidate.strategy == "PULLBACK_WATCH"
+        for candidate in scan_candidates(snapshot, profile="aggressive")
+    )
