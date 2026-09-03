@@ -24,7 +24,12 @@ from kis_ai_scalper.market.clock import KST, kst_today
 from kis_ai_scalper.market.completed_bars import materialize_completed_bars
 
 
-TRANSIENT_WEBSOCKET_CLOSES = {"ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK"}
+TRANSIENT_WEBSOCKET_CLOSES = {
+    "ConnectionClosed",
+    "ConnectionClosedError",
+    "ConnectionClosedOK",
+    "InvalidMessage",
+}
 
 
 @dataclass(frozen=True)
