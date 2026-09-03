@@ -111,6 +111,54 @@ def test_service_cycle_error_sets_automatic_pause_without_operator_pause(tmp_pat
         )
 
 
+def test_service_skips_duplicate_reads_while_supervisor_dependency_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "dependency-gate.sqlite3"
+    with connect_database(db_path) as database:
+        database.init_schema()
+        database.set_runtime_metadata(
+            "order-supervisor.status",
+            '{"status":"dependency_unavailable","reasons":["order_status_unavailable:ReadTimeout"]}',
+        )
+        database.set_runtime_metadata("block_new_entries", "true")
+
+    broker_calls = []
+    monkeypatch.setattr(cli, "_telegram_notifier_from_env", lambda *_args: None)
+    monkeypatch.setattr(cli, "optional_env_value", lambda _name: None)
+    monkeypatch.setattr(cli, "_runtime_preflight", lambda *_args: [])
+    monkeypatch.setattr(cli, "is_regular_market_open", lambda *_args: True)
+    monkeypatch.setattr(cli, "run_order_supervisor", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "_collect_service_market_window",
+        lambda *_args: broker_calls.append("collect"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_make_broker_cycle_state",
+        lambda *_args, **_kwargs: broker_calls.append("broker-state"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_sleep_remaining",
+        lambda *_args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.service_loop(
+            "config/settings.yaml", "005930", str(db_path), "rule", 1, 1,
+            1, 0, 0, False,
+        )
+
+    assert broker_calls == []
+    with connect_database(db_path) as database:
+        assert database.get_runtime_metadata("runtime.auto_paused") == "true"
+        assert database.get_runtime_metadata("runtime.auto_pause_reason") == (
+            "supervisor_dependency_unavailable"
+        )
+
+
 def test_preflight_alert_throttle_persists_across_restart_and_changes_alert_immediately(
     tmp_path, monkeypatch,
 ):
