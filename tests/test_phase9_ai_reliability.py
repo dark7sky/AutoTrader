@@ -80,12 +80,15 @@ def test_prompt_requires_executable_risk_reward_prices():
     session = FakeSession([FakeResponse()])
     client = OpenAITradingDecisionClient("key", session=session)
 
-    decision = client.decide(context())
+    decision = client.decide(context(trade_profile="aggressive"))
 
     system_prompt = session.posts[0][1]["json"]["messages"][0]["content"]
+    user_payload = session.posts[0][1]["json"]["messages"][1]["content"]
     assert "at least 0.5% below entry" in system_prompt
     assert "at least 1.5 times the per-share risk" in system_prompt
-    assert decision.prompt_version == "trade-decision-v3"
+    assert "do not require an exceptional setup" in system_prompt
+    assert '"trade_profile": "aggressive"' in user_payload
+    assert decision.prompt_version == "trade-decision-v4"
 
 
 def test_buy_response_prices_are_normalized_to_executable_risk_plan():
