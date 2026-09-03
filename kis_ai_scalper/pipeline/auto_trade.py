@@ -331,7 +331,11 @@ def _maybe_enter_position(
         return _blocked(symbol, "stale_tick")
     ai_call_count[0] += 1
     decision = ai_client.decide(
-        context_from_snapshot(snapshot, [candidate.__dict__ for candidate in candidates])
+        context_from_snapshot(
+            snapshot,
+            [candidate.__dict__ for candidate in candidates],
+            trade_profile=config.candidate_profile,
+        )
     )
     response_now = _clock_now(clock)
     _record_decision(database, decision, response_now)

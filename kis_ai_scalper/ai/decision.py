@@ -80,6 +80,7 @@ class AIDecisionContext:
     latest_price: float
     open_position: dict[str, Any] | None = None
     market_snapshot_at: datetime | None = None
+    trade_profile: str = "normal"
 
 
 class TradingAIClient(Protocol):
@@ -367,6 +368,7 @@ def context_from_snapshot(
     *,
     open_position: dict[str, Any] | None = None,
     market_snapshot_at: datetime | None = None,
+    trade_profile: str = "normal",
 ) -> AIDecisionContext:
     return AIDecisionContext(
         symbol=snapshot.symbol,
@@ -375,6 +377,7 @@ def context_from_snapshot(
         latest_price=snapshot.latest_close,
         open_position=open_position,
         market_snapshot_at=market_snapshot_at,
+        trade_profile=trade_profile,
     )
 
 
@@ -385,6 +388,7 @@ def _context_payload(context: AIDecisionContext) -> dict[str, Any]:
         "candidates": context.candidates,
         "latest_price": context.latest_price,
         "open_position": context.open_position,
+        "trade_profile": context.trade_profile,
     }
     if context.market_snapshot_at is not None:
         payload["market_snapshot_at"] = _aware(context.market_snapshot_at).isoformat()
@@ -476,12 +480,15 @@ def trading_ai_decision_schema() -> dict[str, Any]:
     }
 
 
-AI_DECISION_PROMPT_VERSION = "trade-decision-v3"
+AI_DECISION_PROMPT_VERSION = "trade-decision-v4"
 
 
 _SYSTEM_PROMPT = (
     "You are an intraday Korean equity trading decision engine. "
-    "Return only the requested JSON schema. Prefer HOLD unless the setup is clear. "
+    "Return only the requested JSON schema. The candidates already passed deterministic "
+    "trend, VWAP, price-position, and volume filters. Use trade_profile to calibrate entry: "
+    "for aggressive, accept a coherent candidate and do not require an exceptional setup; "
+    "use HOLD only for a concrete contradiction, stale/ambiguous data, or unsafe risk plan. "
     "For BUY, set strategy to one of the provided deterministic candidate strategy values. "
     "For BUY, provide a limit entry near the latest price, take-profit above entry, "
     "and stop-loss at least 0.5% below entry. The take-profit reward must be "
