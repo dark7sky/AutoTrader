@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import json
 from typing import Callable, Protocol
 
@@ -56,7 +56,9 @@ def _timestamp(raw: str | None) -> datetime | None:
         value = datetime.fromisoformat(raw)
     except ValueError:
         return None
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    # Preserve the clock form used by the caller. The trading service uses
+    # naive KST datetimes, while tests and some CLI paths use aware datetimes.
+    return value
 
 
 def _cached_symbols(raw: str | None, size: int) -> list[str]:
