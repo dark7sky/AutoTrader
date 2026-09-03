@@ -264,6 +264,27 @@ def test_readiness_reports_blockers_and_market_closed_is_not_one(tmp_path, monke
     assert "blockers: none" in text
 
 
+def test_auto_universe_allows_empty_watchlist_and_is_visible_in_telegram(tmp_path, monkeypatch):
+    path = str(tmp_path / "auto-universe.sqlite3")
+    fake = FakeTelegram()
+    _ready_demo_env(monkeypatch)
+    monkeypatch.setenv("AUTO_UNIVERSE_ENABLED", "true")
+    monkeypatch.setattr(telegram_module, "is_regular_market_open", lambda _: True)
+    with connect_database(path) as database:
+        database.init_schema()
+        database.record_heartbeat("trading-service")
+        database.record_heartbeat("order-supervisor")
+        database.set_runtime_metadata("auto_universe.symbols", '["005930", "068270"]')
+        database.set_runtime_metadata("auto_universe.refreshed_at", "2026-09-03T01:00:00+00:00")
+
+    update = lambda text: {"message": {"chat": {"id": 42}, "text": text}}
+    assert handle_update(update("/readiness"), path, fake, "42")
+    assert "resume_ready=true" in fake.sent[-1][1]
+    assert "auto_universe=005930,068270" in fake.sent[-1][1]
+    assert handle_update(update("/watchlist"), path, fake, "42")
+    assert "자동선정\n005930\n068270" in fake.sent[-1][1]
+
+
 def test_status_and_readiness_show_operator_review_reasons(tmp_path, monkeypatch):
     path = str(tmp_path / "control.sqlite3")
     fake = FakeTelegram()
