@@ -54,6 +54,61 @@ def _auto_universe_symbols(raw: str | None) -> list[str]:
     ]
 
 
+class TelegramApiError(RuntimeError):
+    """Sanitized Telegram failure with machine-readable retry metadata."""
+
+    def __init__(
+        self,
+        method: str,
+        category: str,
+        *,
+        status_code: int | None = None,
+        error_code: int | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        self.method = method
+        self.category = category
+        self.status_code = status_code
+        self.error_code = error_code
+        self.retry_after = retry_after
+        details = [category]
+        if status_code is not None:
+            details.append(f"http_{status_code}")
+        if error_code is not None:
+            details.append(f"error_{error_code}")
+        if retry_after is not None:
+            details.append(f"retry_after_{retry_after}")
+        self.safe_summary = ":".join(details)
+        super().__init__(f"Telegram {method} {self.safe_summary}")
+
+
+def telegram_error_summary(error: Exception) -> str:
+    if isinstance(error, TelegramApiError):
+        return error.safe_summary
+    return type(error).__name__
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _telegram_error_category(status_code: int | None, error_code: int | None) -> str:
+    code = error_code if error_code is not None else status_code
+    if code == 409:
+        return "conflict"
+    if code == 429:
+        return "rate_limited"
+    if code is not None and code >= 500:
+        return "server_error"
+    return "api_error"
+
+
 class TelegramClient:
     """Small requests-only Telegram Bot API client."""
 
@@ -71,12 +126,48 @@ class TelegramClient:
                 json=payload,
                 timeout=self._timeout,
             )
-            response.raise_for_status()
+        except requests.Timeout:
+            raise TelegramApiError(method, "timeout") from None
+        except requests.ConnectionError:
+            raise TelegramApiError(method, "connection_error") from None
         except requests.RequestException:
-            raise RuntimeError(f"Telegram API request failed: {method}") from None
-        body = response.json()
-        if not body.get("ok"):
-            raise RuntimeError(f"Telegram API call failed: {method}")
+            raise TelegramApiError(method, "request_error") from None
+
+        status_code = _positive_int(getattr(response, "status_code", None))
+        try:
+            body = response.json()
+        except (TypeError, ValueError):
+            category = (
+                _telegram_error_category(status_code, None)
+                if status_code is not None and status_code >= 400
+                else "invalid_response"
+            )
+            raise TelegramApiError(
+                method,
+                category,
+                status_code=status_code,
+            ) from None
+        if not isinstance(body, dict):
+            raise TelegramApiError(
+                method,
+                "invalid_response",
+                status_code=status_code,
+            )
+        if body.get("ok") is not True or (status_code is not None and status_code >= 400):
+            error_code = _positive_int(body.get("error_code"))
+            parameters = body.get("parameters")
+            retry_after = (
+                _positive_int(parameters.get("retry_after"))
+                if isinstance(parameters, dict)
+                else None
+            )
+            raise TelegramApiError(
+                method,
+                _telegram_error_category(status_code, error_code),
+                status_code=status_code,
+                error_code=error_code,
+                retry_after=retry_after,
+            )
         return body
 
     def send_message(self, chat_id: str | int, text: str, reply_markup: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -108,7 +199,10 @@ class TelegramClient:
         payload: dict[str, Any] = {"limit": limit, "timeout": timeout}
         if offset is not None:
             payload["offset"] = offset
-        return self._call("getUpdates", payload).get("result", [])
+        result = self._call("getUpdates", payload).get("result", [])
+        if not isinstance(result, list):
+            raise TelegramApiError("getUpdates", "invalid_response")
+        return result
 
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}

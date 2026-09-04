@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kis_ai_scalper import cli
+from kis_ai_scalper.ops.telegram import TelegramApiError
 from kis_ai_scalper.pipeline.order_management import (
     OrderManagementAction,
     OrderManagementReport,
@@ -13,6 +14,58 @@ from kis_ai_scalper.storage import connect_database
 
 
 UTC = timezone.utc
+
+
+def test_telegram_poll_worker_reuses_client_and_backs_off(tmp_path, monkeypatch):
+    class StopEvent:
+        def __init__(self):
+            self.stopped = False
+            self.waits = []
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+
+    clients = []
+    attempts = []
+    stop_event = StopEvent()
+
+    class Client:
+        pass
+
+    def make_client(_token):
+        client = Client()
+        clients.append(client)
+        return client
+
+    def poll(*_args, **kwargs):
+        attempts.append(kwargs["client"])
+        if len(attempts) <= 2:
+            raise TelegramApiError(
+                "getUpdates",
+                "connection_error",
+            )
+        stop_event.stopped = True
+        return 0
+
+    monkeypatch.setattr(cli, "TelegramClient", make_client)
+    monkeypatch.setattr(cli, "poll_telegram", poll)
+
+    cli._telegram_poll_worker(
+        db_path=str(tmp_path / "telegram-worker.sqlite3"),
+        token="token",
+        chat_id="42",
+        limit=10,
+        timeout_seconds=5,
+        stop_event=stop_event,
+        failed_event=cli.threading.Event(),
+    )
+
+    assert len(clients) == 1
+    assert attempts == [clients[0], clients[0], clients[0]]
+    assert stop_event.waits == [1.0, 2.0]
 
 
 def test_service_parser_removes_pause_bypass_and_defaults_collection_to_10(monkeypatch):

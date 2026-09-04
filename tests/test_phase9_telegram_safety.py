@@ -10,6 +10,7 @@ from kis_ai_scalper.ops.telegram import (
     REAL_CHALLENGE_EXPIRES_KEY,
     REAL_CHALLENGE_KEY,
     REAL_RESUME_ARM_EXPIRES_KEY,
+    TelegramApiError,
     TelegramClient,
     handle_update,
     poll_telegram,
@@ -461,6 +462,75 @@ def test_telegram_network_errors_do_not_expose_token():
         def post(self, *args, **kwargs):
             raise requests.ConnectionError("request failed")
 
-    with pytest.raises(RuntimeError) as error:
+    with pytest.raises(TelegramApiError) as error:
         TelegramClient("super-secret-token", session=FailingSession()).get_updates()
+    assert error.value.category == "connection_error"
+    assert "super-secret-token" not in str(error.value)
+
+
+def test_telegram_api_conflict_preserves_safe_codes_without_description():
+    class Response:
+        status_code = 409
+
+        def json(self):
+            return {
+                "ok": False,
+                "error_code": 409,
+                "description": "Conflict involving super-secret-token",
+            }
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    with pytest.raises(TelegramApiError) as error:
+        TelegramClient("super-secret-token", session=Session()).get_updates()
+
+    assert error.value.category == "conflict"
+    assert error.value.status_code == 409
+    assert error.value.error_code == 409
+    assert str(error.value) == "Telegram getUpdates conflict:http_409:error_409"
+    assert "super-secret-token" not in str(error.value)
+
+
+def test_telegram_rate_limit_preserves_retry_after():
+    class Response:
+        status_code = 429
+
+        def json(self):
+            return {
+                "ok": False,
+                "error_code": 429,
+                "parameters": {"retry_after": 17},
+            }
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    with pytest.raises(TelegramApiError) as error:
+        TelegramClient("token", session=Session()).get_updates()
+
+    assert error.value.category == "rate_limited"
+    assert error.value.retry_after == 17
+    assert "retry_after_17" in str(error.value)
+
+
+def test_telegram_server_error_with_non_json_body_keeps_only_http_status():
+    class Response:
+        status_code = 503
+
+        def json(self):
+            raise ValueError("upstream body with super-secret-token")
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    with pytest.raises(TelegramApiError) as error:
+        TelegramClient("super-secret-token", session=Session()).get_updates()
+
+    assert error.value.category == "server_error"
+    assert error.value.status_code == 503
+    assert str(error.value) == "Telegram getUpdates server_error:http_503"
     assert "super-secret-token" not in str(error.value)

@@ -75,10 +75,12 @@ from kis_ai_scalper.ops.telegram import (
     AUTO_PAUSE_REASON_KEY,
     CANCEL_OPEN_BUYS_KEY,
     EMERGENCY_STOP_KEY,
+    TelegramApiError,
     TelegramClient,
     env_value,
     optional_env_value,
     poll_telegram,
+    telegram_error_summary,
 )
 from kis_ai_scalper.ops.trading_frequency import read_trade_frequency
 from kis_ai_scalper.ops.auto_universe import (
@@ -438,6 +440,7 @@ SERVICE_LEASE_TTL_SECONDS = 180
 RETENTION_LAST_DAY_KEY = "market_retention:last_cleanup_day"
 LIVE_REPORT_KEY = "live_report_snapshot"
 SERVICE_ALERT_THROTTLE = timedelta(minutes=15)
+TELEGRAM_POLL_MAX_RETRY_SECONDS = 60.0
 PREFLIGHT_ALERT_FINGERPRINT_KEY = "service:preflight_alert:fingerprint"
 PREFLIGHT_ALERT_AT_KEY = "service:preflight_alert:at"
 ORDER_MANAGEMENT_ALERT_FINGERPRINT_KEY = "service:order_management_alert:fingerprint"
@@ -1268,6 +1271,8 @@ def _telegram_poll_worker(
 ) -> None:
     """Poll Telegram independently so operator controls are responsive during collection."""
 
+    client = TelegramClient(token)
+    retry_delay = 1.0
     while not stop_event.is_set():
         try:
             poll_telegram(
@@ -1276,14 +1281,15 @@ def _telegram_poll_worker(
                 chat_id,
                 limit=limit,
                 timeout_seconds=timeout_seconds,
-                client=TelegramClient(token),
+                client=client,
             )
             failed_event.clear()
+            retry_delay = 1.0
             if timeout_seconds == 0:
                 stop_event.wait(0.1)
         except Exception as exc:
             failed_event.set()
-            warning = f"telegram poll warning: {type(exc).__name__}"
+            warning = f"telegram poll warning: {telegram_error_summary(exc)}"
             print(warning, file=sys.stderr)
             try:
                 with connect_database(db_path) as database:
@@ -1302,7 +1308,16 @@ def _telegram_poll_worker(
                     f"telegram poll state warning: {type(metadata_exc).__name__}",
                     file=sys.stderr,
                 )
-            stop_event.wait(1.0)
+            requested_delay = exc.retry_after if isinstance(exc, TelegramApiError) else None
+            wait_seconds = min(
+                TELEGRAM_POLL_MAX_RETRY_SECONDS,
+                max(retry_delay, float(requested_delay or 0)),
+            )
+            stop_event.wait(wait_seconds)
+            retry_delay = min(
+                TELEGRAM_POLL_MAX_RETRY_SECONDS,
+                retry_delay * 2,
+            )
 
 
 def _env_live_trading_enabled() -> bool:
